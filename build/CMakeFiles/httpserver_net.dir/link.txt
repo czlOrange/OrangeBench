@@ -1,0 +1,2 @@
+/usr/bin/ar qc lib/libhttpserver_net.a CMakeFiles/httpserver_net.dir/src/net/socket.cpp.o CMakeFiles/httpserver_net.dir/src/net/address.cpp.o
+/usr/bin/ranlib lib/libhttpserver_net.a

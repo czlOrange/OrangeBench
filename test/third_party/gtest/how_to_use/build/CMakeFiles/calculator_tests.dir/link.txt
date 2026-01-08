@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/calculator_tests.dir/test_calculator.cpp.o -o calculator_tests  libcalculator_lib.a /usr/lib/x86_64-linux-gnu/libgtest.a /usr/lib/x86_64-linux-gnu/libgtest_main.a /usr/lib/x86_64-linux-gnu/libgtest.a 

@@ -1,0 +1,96 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "构建项目",
+            "type": "shell",
+            "command": "cd ${workspaceFolder} && mkdir -p build && cd build && cmake .. && make -j$(nproc)",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "清理并重新构建",
+            "type": "shell",
+            "command": "cd ${workspaceFolder} && rm -rf build && mkdir -p build && cd build && cmake .. && make -j$(nproc)",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "构建并运行完整测试",
+            "type": "shell",
+            // 修改点1：修正转义符+确保build/bin路径执行（cd到build后再执行bin/simple_test）
+            "command": "cd ${workspaceFolder} && rm -rf build && mkdir -p build && cd build && cmake .. && make -j$(nproc) && echo -e '\\n================================\\n测试输出:\\n================================' && ./bin/simple_test",
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },        
+        {
+            "label": "运行socket测试",
+            "type": "shell",
+            // 修改点2：简化路径，直接在build目录执行
+            "command": "${workspaceFolder}/build/bin/simple_test",
+            "group": "test",
+            "dependsOn": ["构建项目"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "编译socket库",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/build && make httpserver_net",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "仅运行CMake配置",
+            "type": "shell",
+            "command": "cd ${workspaceFolder} && mkdir -p build && cd build && cmake ..",
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "清理构建目录",
+            "type": "shell",
+            "command": "rm -rf ${workspaceFolder}/build",
+            "group": "build",
+            "presentation": {
+                // 修改点3：改为always，清理后能看到终端反馈，确认是否执行成功
+                "reveal": "always",
+                "panel": "shared"
+            }
+        },
+        {
+            "label": "查看构建目录结构",
+            "type": "shell",
+            // 修改点4：优化过滤规则，明确展示test/net目录的测试文件，排除无关文件
+            "command": "echo '项目目录结构（源码+测试文件）：' && cd ${workspaceFolder} && find . -path ./build -prune -o -type f \\( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \\) | sort",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        }
+    ]
+}

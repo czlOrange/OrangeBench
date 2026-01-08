@@ -1,0 +1,18 @@
+{
+    "cmake.configureOnOpen": true,                      // 打开项目时自动执行CMake配置（生成Makefile），无需手动触发cmake ..
+    "cmake.buildDirectory": "${workspaceFolder}/build", // 指定CMake的构建目录为项目根目录下的build文件夹，编译产物统一存放
+    "cmake.generator": "Unix Makefiles",                // 指定CMake生成Unix Makefiles（适配Linux/macOS的make编译规则）
+    "cmake.buildBeforeRun": true,                       // 运行/调试程序前自动编译项目，保证运行的是最新代码
+    "files.associations": {
+        "*.hpp": "cpp",                                 // 将.hpp文件识别为C++文件，确保语法高亮/智能提示正常
+        "*.cpp": "cpp"                                  // 将.cpp文件识别为C++文件，确保语法高亮/智能提示正常
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools", // C/C++插件从CMake Tools同步配置（自动获取头文件路径、编译参数等）
+    //"editor.formatOnSave": true,                        // 保存代码时自动格式化，统一代码风格
+    //"files.trimTrailingWhitespace": true,               // 保存时自动删除代码行末尾的多余空格，清理无效字符
+    "editor.tabSize": 4,                                // 设置制表符（Tab）等价于4个空格，统一缩进宽度
+    "editor.insertSpaces": true,                        // 按Tab键时插入空格而非原生Tab字符，避免不同编辑器缩进显示不一致
+    "[cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools" // 针对C++文件，指定默认格式化工具为VS Code官方C/C++插件
+    }
+}

@@ -1,0 +1,8 @@
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/httpserver_net.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/simple_test.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/edit_cache.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/rebuild_cache.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/list_install_components.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/install.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/install/local.dir
+/CODE/OrangeLi_Http_Server/build/CMakeFiles/install/strip.dir

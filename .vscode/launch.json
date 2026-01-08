@@ -1,0 +1,26 @@
+// 调试配置
+{
+    "version": "0.2.0",             // 调试配置文件的版本（VS Code 固定规范，无需修改）
+    "configurations": [             // 调试配置数组，可定义多个调试规则（此处仅配置1个）
+        {
+            "name": "调试简单测试",  // 调试任务名称（VS Code调试面板中显示的标识，自定义）
+            "type": "cppdbg",       // 调试类型：指定为C/C++调试（VS Code内置的C/C++调试器类型）
+            "request": "launch",    // 调试模式：launch表示「启动新程序并调试」（另一种attach是附加到已运行程序）
+            "program": "${workspaceFolder}/build/bin/simple_test", // 要调试的程序路径：指定编译后的测试程序simple_test（${workspaceFolder}是项目根目录）
+            "args": [],             // 调试时传给程序的命令行参数（如需要传参可写["-port","8080"]，此处无参数）
+            "stopAtEntry": false,   // 是否在程序入口（main函数）自动暂停：false表示直接运行，true则停在main开头
+            "cwd": "${workspaceFolder}",    // 调试时的工作目录：设为项目根目录，保证程序读取文件/路径的正确性
+            "environment": [],              // 调试时的环境变量（如需要自定义环境变量可写["PATH=/usr/local/bin"]，此处无额外变量）
+            "externalConsole": false,       // 是否弹出系统终端：false表示使用VS Code内置终端调试，更便捷
+            "MIMode": "gdb",                // 指定调试器：使用GDB（Linux/macOS下主流的C/C++调试器）
+            "setupCommands": [              // 调试前发给GDB的初始化指令
+                {
+                    "description": "为 gdb 启用整齐打印",    // 指令描述（仅注释，无实际执行逻辑）
+                    "text": "-enable-pretty-printing",      // 启用GDB的「整齐打印」：让结构体/容器等调试输出更易读
+                    "ignoreFailures": true                  // 忽略该指令执行失败（避免因GDB版本问题导致调试启动失败）
+                }
+            ],
+            "preLaunchTask": "构建项目"      // 调试前自动执行的任务：先运行tasks.json中「构建项目」任务，保证调试最新编译的代码
+        }
+    ]
+}
