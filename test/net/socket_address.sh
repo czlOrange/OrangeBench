@@ -6,7 +6,7 @@ echo ""
 
 # 直接编译测试程序
 echo "📦 编译测试程序..."
-g++ -std=c++17 -I./include test/net/socket_address.cpp src/net/socket.cpp src/net/address.cpp -o test/net/socket_address
+g++ -std=c++17 -I./include test/net/socket_address.cpp src/net/socket.cpp src/net/address.cpp -o test/net/socket_address #核心语句
 if [ $? -eq 0 ]; then
     echo "✅ 编译成功！"
     echo ""

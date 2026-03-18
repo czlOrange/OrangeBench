@@ -27,7 +27,7 @@ public:
     
     // 零拷贝操作
     struct Iovec {
-        void* data;
+        const void* data;
         size_t len;
     };
     

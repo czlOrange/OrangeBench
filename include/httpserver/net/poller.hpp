@@ -17,9 +17,17 @@ enum class EventType {
     RDHUP = 0x10    // 对端关闭
 };
 
-// 回调函数类型自定一位EventCallback
+// 支持位运算
+inline EventType operator|(EventType lhs, EventType rhs) {
+    return static_cast<EventType>(static_cast<int>(lhs) | static_cast<int>(rhs));
+}
+
+inline EventType operator&(EventType lhs, EventType rhs) {
+    return static_cast<EventType>(static_cast<int>(lhs) & static_cast<int>(rhs));
+}
+
+// 回调函数类型定义
 using EventCallback = std::function<void(int fd, EventType events)>;
-typedef std::function<void(int fd, httpserver::net::EventType events)> EventCallback;
 
 /**
  * @brief 事件轮询器抽象类

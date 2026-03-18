@@ -8,5 +8,5 @@ public:
     int Multiply(int a, int b);
     double Divide(int a, int b);
 };
-
+//我做了一个修改
 #endif

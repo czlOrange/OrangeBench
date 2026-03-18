@@ -23,6 +23,7 @@ protected:
         // 每个测试前的设置
         calc = new Calculator();
     }    
+    
     void TearDown() override {
         // 每个测试后的清理
         delete calc;
@@ -48,7 +49,7 @@ TEST(CalculatorTest, DivisionPrecision) {
     EXPECT_NEAR(calc.Divide(1, 3), 0.33333, 0.00001);
 }
 
-int main(int argc, char **argv) {           //
+int main(int argc, char **argv) {           
     ::testing::InitGoogleTest(&argc, argv); //初始
     return RUN_ALL_TESTS();                 //执行
 }
