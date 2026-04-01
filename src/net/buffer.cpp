@@ -1,190 +1,349 @@
 // ============================================================================
-// 文件: examples/ringbuffer_demo.cpp
-// 描述: 环形缓冲区使用示例
+// 文件: src/net/buffer.cpp
+// 描述: RingBuffer 环形缓冲区实现
 // ============================================================================
 
-#include "httpserver/net/buffer.hpp"
-#include <iostream>
-#include <thread>
+#include "../../include/httpserver/net/buffer.hpp"
 #include <cstring>
+#include <stdexcept>
+#include <algorithm>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#endif
+namespace httpserver::net {
 
-using namespace httpserver::net;
+// ============================================================================
+// 构造函数
+// ============================================================================
 
-void demo_basic_operations() {
-    std::cout << "\n=== 基础操作示例 ===\n";
-    
-    RingBuffer buffer(16); // 小缓冲区便于观察
-    
-    // 写入数据
-    std::string msg = "Hello";
-    buffer.write(msg);
-    std::cout << "写入: " << msg << std::endl;
-    std::cout << "可读字节: " << buffer.readable_bytes() << std::endl;
-    
-    // 读取数据
-    auto read_msg = buffer.read_string(5);
-    std::cout << "读取: " << read_msg << std::endl;
-    std::cout << "可读字节: " << buffer.readable_bytes() << std::endl;
+RingBuffer::RingBuffer(size_t initial_capacity) 
+    : buffer_(std::max(initial_capacity, size_t(4))) {
+    if (initial_capacity == 0) {
+        throw std::invalid_argument("RingBuffer capacity cannot be 0");
+    }
+    read_pos_ = 0;
+    write_pos_ = 0;
 }
 
-void demo_zero_copy() {
-    std::cout << "\n=== 零拷贝操作示例 ===\n";
-    
-    RingBuffer buffer(1024);
-    
-    // 准备数据
-    std::string data = "This is a zero-copy example";
-    buffer.write(data);
-    
-    // 获取可读区域
-    auto [area1, area2] = buffer.readable_areas();
-    
-    std::cout << "可读区域1: " << area1.len << " 字节\n";
-    if (area1.data) {
-        std::cout << "  内容: " << std::string_view((const char*)area1.data, area1.len) << std::endl;
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
+size_t RingBuffer::front_capacity() const {
+    if (read_pos_ <= write_pos_) {
+        return 0;
     }
-    
-    if (area2.data) {
-        std::cout << "可读区域2: " << area2.len << " 字节\n";
-        std::cout << "  内容: " << std::string_view((const char*)area2.data, area2.len) << std::endl;
-    }
-    
-    // 标记已读取
-    buffer.has_read(area1.len + (area2.len ? area2.len : 0));
-    std::cout << "读取后可读字节: " << buffer.readable_bytes() << std::endl;
+    return read_pos_ - write_pos_;
 }
 
-void demo_search() {
-    std::cout << "\n=== 搜索功能示例 ===\n";
-    
-    RingBuffer buffer(32);
-    
-    // 写入HTTP请求
-    buffer.write("GET /index.html HTTP/1.1\r\n");
-    buffer.write("Host: localhost\r\n");
-    buffer.write("\r\n");
-    
-    // 查找HTTP头结束标志
-    size_t pos = buffer.find("\r\n\r\n");
-    if (pos != std::string::npos) {
-        std::cout << "找到HTTP头结束位置: " << pos << std::endl;
-        
-        // 读取HTTP头
-        auto header = buffer.read_string(pos + 4);
-        std::cout << "HTTP头:\n" << header << std::endl;
+size_t RingBuffer::back_capacity() const {
+    if (write_pos_ < read_pos_) {
+        return read_pos_ - write_pos_;
     }
-    
-    // 查找单个字符
-    pos = buffer.find('/');
-    if (pos != std::string::npos) {
-        std::cout << "找到 '/' 在位置: " << pos << std::endl;
-    }
+    return capacity() - write_pos_;
 }
 
-void demo_network_integration() {
-    std::cout << "\n=== 网络集成示例 ===\n";
+void RingBuffer::expand_if_needed(size_t len) {
+    if (writable_bytes() >= len) {
+        return;
+    }
     
-    // 模拟网络接收
-    RingBuffer recv_buffer(4096);
+    size_t new_capacity = capacity();
+    while (new_capacity - readable_bytes() - 1 < len) {
+        new_capacity *= 2;
+    }
     
-    // 模拟收到数据
-    const char* packets[] = {
-        "HTTP/1.1 200 OK\r\n",
-        "Content-Type: text/html\r\n",
-        "Content-Length: 13\r\n",
-        "\r\n",
-        "Hello, World!"
-    };
+    std::vector<char> new_buffer(new_capacity);
     
-    // 接收数据（零拷贝场景）
-    for (auto* packet : packets) {
-        size_t len = strlen(packet);
-        recv_buffer.ensure_writable(len);
+    if (!empty()) {
+        auto areas = readable_areas();
+        char* dst = new_buffer.data();
         
-        // 获取可写区域
-        auto [area1, area2] = recv_buffer.writable_areas();
-        
-        // 模拟从socket接收
-        std::memcpy((void*)area1.data, packet, std::min(len, area1.len));
-        if (len > area1.len && area2.data) {
-            std::memcpy((void*)area2.data, packet + area1.len, len - area1.len);
+        if (areas.first.len > 0) {
+            std::memcpy(dst, areas.first.data, areas.first.len);
+            dst += areas.first.len;
         }
         
-        recv_buffer.has_written(len);
-        std::cout << "收到 " << len << " 字节，总缓冲: " 
-                  << recv_buffer.readable_bytes() << std::endl;
-    }
-    
-    // 处理收到的完整消息
-    std::cout << "\n完整消息:\n";
-    while (!recv_buffer.empty()) {
-        auto [r1, r2] = recv_buffer.readable_areas();
-        
-        if (r1.data) {
-            std::cout.write((const char*)r1.data, r1.len);
+        if (areas.second.len > 0) {
+            std::memcpy(dst, areas.second.data, areas.second.len);
         }
-        if (r2.data) {
-            std::cout.write((const char*)r2.data, r2.len);
+    }
+    
+    buffer_.swap(new_buffer);
+    read_pos_ = 0;
+    write_pos_ = readable_bytes();
+}
+
+// ============================================================================
+// 写入操作
+// ============================================================================
+
+size_t RingBuffer::write(const void* data, size_t len) {
+    if (!data || len == 0) {
+        return 0;
+    }
+    
+    expand_if_needed(len);
+    
+    size_t writable = writable_bytes();
+    size_t write_len = std::min(len, writable);
+    
+    if (write_len == 0) {
+        return 0;
+    }
+    
+    size_t back = back_capacity();
+    const char* src = static_cast<const char*>(data);
+    
+    if (back >= write_len) {
+        // 一次性写入后面
+        std::memcpy(&buffer_[write_pos_], src, write_len);
+    } else {
+        // 分两部分写入
+        std::memcpy(&buffer_[write_pos_], src, back);
+        std::memcpy(&buffer_[0], src + back, write_len - back);
+    }
+    
+    write_pos_ = (write_pos_ + write_len) % capacity();
+    return write_len;
+}
+
+size_t RingBuffer::write(const std::string& str) {
+    return write(str.data(), str.size());
+}
+
+// ============================================================================
+// 读取操作
+// ============================================================================
+
+size_t RingBuffer::read(void* buf, size_t len) {
+    if (!buf || len == 0 || empty()) {
+        return 0;
+    }
+    
+    size_t readable = readable_bytes();
+    size_t read_len = std::min(len, readable);
+    
+    char* dst = static_cast<char*>(buf);
+    size_t back = capacity() - read_pos_;
+    
+    if (back >= read_len) {
+        // 一次性读取
+        std::memcpy(dst, &buffer_[read_pos_], read_len);
+    } else {
+        // 分两部分读取
+        std::memcpy(dst, &buffer_[read_pos_], back);
+        std::memcpy(dst + back, &buffer_[0], read_len - back);
+    }
+    
+    has_read(read_len);
+    return read_len;
+}
+
+std::string RingBuffer::read_string(size_t len) {
+    if (len == 0 || empty()) {
+        return "";
+    }
+    
+    size_t readable = readable_bytes();
+    size_t read_len = std::min(len, readable);
+    
+    std::string result;
+    result.resize(read_len);
+    
+    size_t actual = read(&result[0], read_len);
+    result.resize(actual);
+    
+    return result;
+}
+
+// ============================================================================
+// 零拷贝操作
+// ============================================================================
+
+std::pair<RingBuffer::Iovec, RingBuffer::Iovec> 
+RingBuffer::writable_areas() const {
+    Iovec first, second;
+    first.data = nullptr;
+    second.data = nullptr;
+    first.len = 0;
+    second.len = 0;
+    
+    if (full()) {
+        return {first, second};
+    }
+    
+    if (write_pos_ < read_pos_) {
+        first.data = &buffer_[write_pos_];
+        first.len = read_pos_ - write_pos_ - 1;
+    } else {
+        first.data = &buffer_[write_pos_];
+        first.len = capacity() - write_pos_;
+        
+        if (read_pos_ > 0) {
+            if (write_pos_ == 0) {
+                first.len = capacity() - 1;
+            } else {
+                second.data = &buffer_[0];
+                second.len = read_pos_;
+            }
+        } else {
+            first.len = capacity() - write_pos_ - 1;
+        }
+    }
+    
+    return {first, second};
+}
+
+std::pair<RingBuffer::Iovec, RingBuffer::Iovec> 
+RingBuffer::readable_areas() const {
+    Iovec first, second;
+    first.data = nullptr;
+    second.data = nullptr;
+    first.len = 0;
+    second.len = 0;
+    
+    if (empty()) {
+        return {first, second};
+    }
+    
+    if (write_pos_ > read_pos_) {
+        first.data = &buffer_[read_pos_];
+        first.len = write_pos_ - read_pos_;
+    } else {
+        first.data = &buffer_[read_pos_];
+        first.len = capacity() - read_pos_;
+        
+        if (write_pos_ > 0) {
+            second.data = &buffer_[0];
+            second.len = write_pos_;
+        }
+    }
+    
+    return {first, second};
+}
+
+// ============================================================================
+// 指针移动
+// ============================================================================
+
+void RingBuffer::has_written(size_t len) {
+    if (len > writable_bytes()) {
+        throw std::out_of_range("has_written exceeds writable bytes");
+    }
+    write_pos_ = (write_pos_ + len) % capacity();
+}
+
+void RingBuffer::has_read(size_t len) {
+    if (len > readable_bytes()) {
+        throw std::out_of_range("has_read exceeds readable bytes");
+    }
+    read_pos_ = (read_pos_ + len) % capacity();
+    
+    if (read_pos_ == write_pos_) {
+        read_pos_ = 0;
+        write_pos_ = 0;
+    }
+}
+
+// ============================================================================
+// 查找操作
+// ============================================================================
+
+size_t RingBuffer::find(char c) const {
+    if (empty()) {
+        return std::string::npos;
+    }
+    
+    size_t readable = readable_bytes();
+    size_t back = capacity() - read_pos_;
+    
+    if (readable <= back) {
+        auto it = std::find(buffer_.begin() + read_pos_, 
+                           buffer_.begin() + read_pos_ + readable, c);
+        if (it != buffer_.begin() + read_pos_ + readable) {
+            return it - (buffer_.begin() + read_pos_);
+        }
+    } else {
+        auto it1 = std::find(buffer_.begin() + read_pos_, buffer_.end(), c);
+        if (it1 != buffer_.end()) {
+            return it1 - (buffer_.begin() + read_pos_);
         }
         
-        recv_buffer.has_read(r1.len + (r2.len ? r2.len : 0));
+        auto it2 = std::find(buffer_.begin(), 
+                            buffer_.begin() + (readable - back), c);
+        if (it2 != buffer_.begin() + (readable - back)) {
+            return (buffer_.end() - (buffer_.begin() + read_pos_)) + 
+                   (it2 - buffer_.begin());
+        }
     }
-    std::cout << std::endl;
+    
+    return std::string::npos;
 }
 
-void demo_auto_expand() {
-    std::cout << "\n=== 自动扩容示例 ===\n";
-    
-    RingBuffer buffer(8); // 很小的初始容量
-    std::cout << "初始容量: " << buffer.capacity() << std::endl;
-    
-    // 写入数据，触发自动扩容
-    for (int i = 0; i < 5; ++i) {
-        std::string data(4, 'A' + i); // "AAAA", "BBBB", ...
-        buffer.write(data);
-        std::cout << "写入 " << data << " 后容量: " 
-                  << buffer.capacity() << std::endl;
+size_t RingBuffer::find(const std::string& pattern) const {
+    if (pattern.empty() || pattern.size() > readable_bytes()) {
+        return std::string::npos;
     }
+    
+    for (size_t i = 0; i <= readable_bytes() - pattern.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < pattern.size(); ++j) {
+            size_t pos = (read_pos_ + i + j) % capacity();
+            if (buffer_[pos] != pattern[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return i;
+        }
+    }
+    
+    return std::string::npos;
 }
 
-void demo_shrink() {
-    std::cout << "\n=== 收缩示例 ===\n";
-    
-    RingBuffer buffer(1024);
-    std::cout << "初始容量: " << buffer.capacity() << std::endl;
-    
-    // 写入大量数据
-    std::string large_data(800, 'X');
-    buffer.write(large_data);
-    std::cout << "写入后容量: " << buffer.capacity() << std::endl;
-    
-    // 读取部分数据
-    buffer.read_string(700);
-    std::cout << "读取后可读: " << buffer.readable_bytes() << std::endl;
-    
-    // 收缩
-    buffer.shrink_to_fit();
-    std::cout << "收缩后容量: " << buffer.capacity() << std::endl;
+// ============================================================================
+// 内存管理
+// ============================================================================
+
+void RingBuffer::ensure_writable(size_t len) {
+    expand_if_needed(len);
 }
 
-int main() {
-    std::cout << "=== 环形缓冲区演示 ===\n";
+void RingBuffer::shrink_to_fit() {
+    if (empty()) {
+        if (capacity() > 1024) {
+            buffer_.resize(1024);
+        }
+        read_pos_ = 0;
+        write_pos_ = 0;
+        return;
+    }
     
-    demo_basic_operations();
-    demo_zero_copy();
-    demo_search();
-    demo_network_integration();
-    demo_auto_expand();
-    demo_shrink();
+    size_t readable = readable_bytes();
+    size_t new_capacity = std::max(readable * 2, size_t(1024));
+    new_capacity = std::min(new_capacity, capacity());
     
-    return 0;
+    if (new_capacity >= capacity()) {
+        return;
+    }
+    
+    std::vector<char> new_buffer(new_capacity);
+    
+    auto areas = readable_areas();
+    char* dst = new_buffer.data();
+    
+    if (areas.first.len > 0) {
+        std::memcpy(dst, areas.first.data, areas.first.len);
+        dst += areas.first.len;
+    }
+    
+    if (areas.second.len > 0) {
+        std::memcpy(dst, areas.second.data, areas.second.len);
+    }
+    
+    buffer_.swap(new_buffer);
+    read_pos_ = 0;
+    write_pos_ = readable;
 }
+
+} // namespace httpserver::net

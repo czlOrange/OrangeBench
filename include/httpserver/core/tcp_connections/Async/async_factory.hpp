@@ -15,7 +15,7 @@ public:
     static std::shared_ptr<IScheduler> CreateScheduler(
         size_t thread_count = 0);
     
-    // 创建连接操作工具 - 就像给已有的分拣中心配置前台控制台
+    // 创建连接操作工具 - 就像给已有的分拣中心配置前台控制台    
     // 需要传入一个已有的分拣中心（调度器），配置成完整的快递服务系统
     static std::unique_ptr<ConnectionOperations> CreateConnectionOps(
         std::shared_ptr<IScheduler> scheduler);

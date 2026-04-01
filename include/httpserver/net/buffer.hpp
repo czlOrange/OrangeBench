@@ -46,8 +46,17 @@ public:
     size_t find(char c) const;
     
     // 状态查询
-    size_t readable_bytes() const { return write_pos_ - read_pos_; }
-    size_t writable_bytes() const { return capacity() - readable_bytes(); }
+    size_t readable_bytes() const { 
+        if (write_pos_ >= read_pos_) {
+            return write_pos_ - read_pos_;
+        } else {
+            return capacity() - (read_pos_ - write_pos_);
+        }
+    }
+    size_t writable_bytes() const { 
+        size_t total = capacity() - readable_bytes();
+        return total > 0 ? total - 1 : 0;
+    }
     size_t capacity() const { return buffer_.size(); }
     bool empty() const { return readable_bytes() == 0; }
     bool full() const { return writable_bytes() == 0; }

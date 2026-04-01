@@ -2,19 +2,32 @@
 #pragma once
 
 #include "connection_state.hpp"
-#include "io_handler.hpp"
-#include "buffer_manager.hpp"
-#include "async_operation.hpp"
-#include "event_dispatcher.hpp"
+#include "../IO/io_handler.hpp"
+#include "../Buffer/buffer_manager.hpp"
+#include "../Async/async_operation.hpp"
+#include "../Async/async_scheduler.hpp"
+#include "../Event/event_dispatcher.hpp"
 #include <memory>
 #include <string>
 #include <system_error>
-#include <expected>
+#include <any>
+#include <future>
+#include <functional>
+#include <unordered_map>
 
 namespace httpserver::core {
 
 // 前向声明
 class IConnectionManager;
+
+// 异步结果类型别名
+template<typename T>
+using AsyncResult = std::future<T>;
+
+// 事件回调类型（需要 IConnection 前向声明，这里先声明类型）
+using EventCallback = std::function<void(ConnectionEvent, std::shared_ptr<IConnection>)>;
+using DataCallback = std::function<void(std::shared_ptr<IConnection>, std::string_view)>;
+using ErrorCallback = std::function<void(std::shared_ptr<IConnection>, std::error_code)>;
 
 // 连接接口
 class IConnection : public std::enable_shared_from_this<IConnection> {
@@ -28,16 +41,12 @@ public:
     virtual void Close() noexcept = 0;
     
     // 同步数据操作
-    virtual std::expected<size_t, std::error_code> 
-        Send(std::string_view data) = 0;
-    virtual std::expected<size_t, std::error_code> 
-        Send(const void* data, size_t len) = 0;
-    virtual std::expected<std::string, std::error_code> 
-        Receive(size_t max_len = 4096) = 0;
-    virtual std::expected<size_t, std::error_code> 
-        Receive(void* buffer, size_t len) = 0;
+    virtual std::pair<size_t, std::error_code> Send(std::string_view data) = 0;
+    virtual std::pair<size_t, std::error_code> Send(const void* data, size_t len) = 0;
+    virtual std::pair<std::string, std::error_code> Receive(size_t max_len = 4096) = 0;
+    virtual std::pair<size_t, std::error_code> Receive(void* buffer, size_t len) = 0;
     
-    // 异步数据操作（使用调度器）
+    // 异步数据操作
     virtual AsyncResult<size_t> SendAsync(std::string_view data) = 0;
     virtual AsyncResult<size_t> SendAsync(const void* data, size_t len) = 0;
     virtual AsyncResult<std::string> ReceiveAsync(size_t max_len = 4096) = 0;
@@ -83,7 +92,7 @@ public:
     // 文件描述符
     virtual int GetFd() const = 0;
     
-    // 事件回调（通过事件管理器）
+    // 事件回调
     virtual void SetEventCallback(EventCallback callback) = 0;
     virtual void SetDataCallback(DataCallback callback) = 0;
     virtual void SetErrorCallback(ErrorCallback callback) = 0;
@@ -110,7 +119,7 @@ public:
     static std::shared_ptr<IConnection> Create(
         std::shared_ptr<IIOHandler> io_handler,
         std::shared_ptr<IBufferManager> buffer_manager,
-        std::shared_ptr<IAsyncScheduler> scheduler,
+        std::shared_ptr<async::IScheduler> scheduler,      // 改为 async::IScheduler
         std::shared_ptr<IEventDispatcher> dispatcher);
 };
 

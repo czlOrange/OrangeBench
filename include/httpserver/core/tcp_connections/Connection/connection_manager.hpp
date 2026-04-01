@@ -1,7 +1,7 @@
 // src/httpserver/core/connections/connection_manager.hpp
 #pragma once
 
-#include "connection_standard.hpp"  // IConnection, ConnectionState, SocketAddress
+#include "connection_interface.hpp"  // IConnection, ConnectionState, SocketAddress
 #include <memory>
 #include <unordered_map>
 #include <vector>

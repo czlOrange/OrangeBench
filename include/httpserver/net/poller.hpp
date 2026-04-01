@@ -1,64 +1,55 @@
-// include/httpserver/net/poller.hpp
 #pragma once
 
 #include <functional>
 #include <vector>
 #include <memory>
+#include <system_error>
 
 namespace httpserver::net {
 
-// 事件类型
-enum class EventType {
-    NONE = 0x00,    // 无事件
-    READ = 0x01,    // 读就绪事件
-    WRITE = 0x02,   // 写就绪事件
-    ERROR = 0x04,   // 错误事件
-    HUP = 0x08,     // 挂起
-    RDHUP = 0x10    // 对端关闭
-};
+// 使用类型别名提高可读性
+using EventMask = uint32_t;
 
-// 支持位运算
-inline EventType operator|(EventType lhs, EventType rhs) {
-    return static_cast<EventType>(static_cast<int>(lhs) | static_cast<int>(rhs));
-}
+// 事件常量（C++17 inline constexpr）
+inline constexpr EventMask EVENT_NONE   = 0x00;
+inline constexpr EventMask EVENT_READ   = 0x01;
+inline constexpr EventMask EVENT_WRITE  = 0x02;
+inline constexpr EventMask EVENT_ERROR  = 0x04;
+inline constexpr EventMask EVENT_HUP    = 0x08;
+inline constexpr EventMask EVENT_RDHUP  = 0x10;
 
-inline EventType operator&(EventType lhs, EventType rhs) {
-    return static_cast<EventType>(static_cast<int>(lhs) & static_cast<int>(rhs));
-}
-
-// 回调函数类型定义
-using EventCallback = std::function<void(int fd, EventType events)>;
+// 回调：fd, 就绪事件, 用户上下文
+using EventCallback = std::function<void(int fd, EventMask events, void* ctx)>;
 
 /**
- * @brief 事件轮询器抽象类
+ * @brief 事件轮询器抽象
  * 
- * 支持不同的事件驱动模型：select/poll/epoll/kqueue
+ * 封装 select/poll/epoll/kqueue 等系统调用
+ * 生命周期：构造 -> add_fd(循环) -> poll(循环) -> 析构
  */
 class Poller {
 public:
-    // 结构体
     struct Event {
-        int fd; 
-        EventType events;   // 该FD上就绪的事件类型
-        void* user_data;    // 自定义用户数据指针
+        int fd;
+        EventMask events;      // 就绪的事件
+        void* context;         // 用户自定义上下文
     };
     
-    // 析构函数
     virtual ~Poller() = default;
     
-    // 核心接口  
-    virtual bool add_fd(int fd, EventType events, void* user_data = nullptr) = 0;
-    virtual bool mod_fd(int fd, EventType events, void* user_data = nullptr) = 0;
-    virtual bool del_fd(int fd) = 0;
+    // 核心接口（失败抛出 std::system_error）
+    virtual void add_fd(int fd, EventMask events, void* context = nullptr) = 0;
+    virtual void mod_fd(int fd, EventMask events, void* context = nullptr) = 0;
+    virtual void del_fd(int fd) = 0;
     
-    // 轮询
-    virtual int poll(std::vector<Event>& events, int timeout_ms = -1) = 0;
+    // 轮询事件
+    virtual int poll(std::vector<Event>& active_events, int timeout_ms = -1) = 0;
     
-    // 配置
-    virtual void set_max_events(size_t max) = 0;
+    // 查询能力
     virtual size_t max_events() const = 0;
+    virtual const char* name() const = 0;  // "epoll"/"kqueue"/"poll"/"select"
     
-    // 工厂方法
+    // 工厂
     static std::unique_ptr<Poller> create_default();
 };
 

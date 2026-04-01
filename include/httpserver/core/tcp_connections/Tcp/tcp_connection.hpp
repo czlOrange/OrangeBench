@@ -23,8 +23,7 @@ public:
         std::shared_ptr<IAsyncScheduler> scheduler,       // 调度系统（安排送货时间）
         std::shared_ptr<IEventDispatcher> dispatcher);    // 事件通知器（重要事情喊一嗓）
     
-    // 从现有文件描述符创建
-    // 特殊情况：接手一个已经在路上的快递单（比如服务器accept接收到的连接）
+    // 特殊情况：(从现有文件描述符创建)接手一个已经在路上的快递单（比如服务器accept接收到的连接）
     TCPConnection(
         int existing_fd,                                   // 已有的对讲机频道
         const SocketAddress& peer_addr,                    // 对方地址
