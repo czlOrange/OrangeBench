@@ -14,41 +14,34 @@
         .status.completed { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
     </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- 暂时注释 Chart.js
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    -->
 </head>
 <body>
 <div class="container">
     <h1>📡 局域网测速工具</h1>
     <div class="speed-value" id="speedValue">0.00</div>
     <div>Mbps</div>
+    <!-- 暂时隐藏图表
     <canvas id="speedChart" width="500" height="200"></canvas>
+    -->
     <button id="startBtn">开始测速</button>
     <div class="status" id="status">⚪ 未连接</div>
 </div>
 
 <script>
-    let ws = null, isTesting = false, totalBytes = 0, startTime = 0, chart = null, speedHistory = [];
+    let ws = null, isTesting = false, totalBytes = 0, startTime = 0, speedHistory = [];
     let updateInterval = null;
     let deviceId = localStorage.getItem('device_id') || 'device_' + Math.random().toString(36).substr(2, 8);
     localStorage.setItem('device_id', deviceId);
     
-    const ctx = document.getElementById('speedChart').getContext('2d');
-    chart = new Chart(ctx, {
-        type: 'line',
-        data: { labels: [], datasets: [{ label: '速率 (Mbps)', data: [], borderColor: '#667eea', fill: true }] },
-        options: { responsive: true, scales: { y: { beginAtZero: true } } }
-    });
-    
     function updateUI() {
         if (!isTesting) return;
         let elapsed = (Date.now() - startTime) / 1000;
+        if (elapsed < 0.1) return;
         let speedMbps = (totalBytes * 8) / elapsed / 1e6;
         document.getElementById('speedValue').innerText = speedMbps.toFixed(2);
-        speedHistory.push(speedMbps);
-        if (speedHistory.length > 60) speedHistory.shift();
-        chart.data.labels = speedHistory.map((_, i) => i);
-        chart.data.datasets[0].data = speedHistory;
-        chart.update();
     }
     
     async function saveRecord(speed) {
@@ -62,6 +55,7 @@
                     device_name: navigator.userAgent.split(' ')[0] || 'Unknown'
                 })
             });
+            console.log('记录已保存');
         } catch(e) { console.error('保存失败', e); }
     }
     
@@ -71,6 +65,7 @@
         ws.binaryType = 'arraybuffer';
         
         ws.onopen = () => {
+            console.log('✅ WebSocket 连接成功');
             isTesting = true;
             totalBytes = 0;
             startTime = Date.now();
@@ -83,21 +78,27 @@
         };
         
         ws.onmessage = (e) => {
-            if (e.data instanceof ArrayBuffer) totalBytes += e.data.byteLength;
+            if (e.data instanceof ArrayBuffer) {
+                totalBytes += e.data.byteLength;
+                console.log('收到数据:', e.data.byteLength, '总:', totalBytes);
+            }
         };
         
         ws.onclose = () => {
+            console.log('WebSocket 连接关闭');
             isTesting = false;
             if (updateInterval) clearInterval(updateInterval);
             let elapsed = (Date.now() - startTime) / 1000;
+            if (elapsed < 0.1) elapsed = 1;
             let finalSpeed = (totalBytes * 8) / elapsed / 1e6;
             document.getElementById('status').className = 'status completed';
             document.getElementById('status').innerHTML = '🔴 测速完成 - ' + finalSpeed.toFixed(1) + ' Mbps';
             document.getElementById('startBtn').disabled = false;
-            saveRecord(finalSpeed);
+            if (totalBytes > 0) saveRecord(finalSpeed);
         };
         
-        ws.onerror = () => {
+        ws.onerror = (error) => {
+            console.error('WebSocket 错误:', error);
             document.getElementById('status').className = 'status error';
             document.getElementById('status').innerHTML = '⚠️ 连接错误';
             document.getElementById('startBtn').disabled = false;

@@ -1,9 +1,10 @@
 #pragma once
 
-#include "http_request.hpp"
 #include <string>
 
 namespace httpserver::application::http {
+
+class HttpRequest;
 
 class HttpParser {
 public:
