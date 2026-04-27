@@ -1,10 +1,10 @@
 // src/net/socket.cpp
-#include "httpserver/core/net/socket.hpp"
-#include "httpserver/core/net/address.hpp"
+#include "httpserver/net/socket.hpp"
+#include "httpserver/core/net/io_handler.hpp"
+#include "httpserver/net/address.hpp"
 
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
@@ -19,10 +19,6 @@
 namespace httpserver::net {
 
 namespace {
-
-std::string last_error() {
-    return std::strerror(errno);
-}
 
 void socket_type_to_native(SocketType type, int& domain, int& sock_type, int& protocol) {
     switch (type) {
@@ -62,462 +58,379 @@ bool netaddress_to_sockaddr_in(const NetAddress& addr, struct sockaddr_in& sa) {
     return true;
 }
 
-template<typename T>
-bool set_socket_option(int fd, int level, int optname, const T& value) {
-    return ::setsockopt(fd, level, optname, &value, sizeof(value)) == 0;
-}
-
-bool set_timeout_option(int fd, int level, int optname, int timeout_ms) {
-    if (timeout_ms <= 0) return true;
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    return set_socket_option(fd, level, optname, tv);
-}
-
-// 检查 socket 是否已绑定
-bool is_bound(int fd) {
-    struct sockaddr_in sa;
-    socklen_t len = sizeof(sa);
-    if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&sa), &len) != 0) {
-        return false;
-    }
-    // 检查是否绑定了具体地址（非 0.0.0.0:0）
-    return sa.sin_port != 0;
-}
-
 } // unnamed namespace
 
 class SocketImpl : public Socket {
 public:
-    explicit SocketImpl(SocketType type)
-        : fd_(-1), type_(type), is_connected_(false), last_error_(0) {
+    // 构造函数：主动创建 socket
+    explicit SocketImpl(SocketType type, std::shared_ptr<core::IIOHandler> io_handler)
+        : io_handler_(std::move(io_handler)), type_(type), fd_(-1), is_connected_(false) {
         int domain, socktype, protocol;
         socket_type_to_native(type_, domain, socktype, protocol);
-        fd_ = ::socket(domain, socktype, protocol);
-        if (fd_ < 0) {
-            throw std::system_error(errno, std::system_category(), 
-                                    "创建 socket 失败");
+        auto result = io_handler_->CreateSocket(domain, socktype, protocol);
+        if (!result) {
+            throw std::system_error(result.error(), "创建 socket 失败");
         }
+        fd_ = result.value();
     }
 
-    SocketImpl(int fd, SocketType type)
-        : fd_(fd), type_(type), is_connected_(false), last_error_(0) {
+    // 构造函数：从已有 fd 包装（常用于 accept）
+    SocketImpl(int fd, SocketType type, std::shared_ptr<core::IIOHandler> io_handler)
+        : io_handler_(std::move(io_handler)), type_(type), fd_(fd), is_connected_(false) {
         if (fd_ < 0) {
             throw std::invalid_argument("无效的文件描述符");
         }
-        struct sockaddr_in sa;
-        socklen_t len = sizeof(sa);
-        if (::getpeername(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len) == 0) {
-            is_connected_ = true;
-        }
+        // 检查是否已连接
+        auto result = io_handler_->GetPeerAddress(fd_);
+        is_connected_ = result.has_value();
     }
 
-    ~SocketImpl() override {
-        close();
-    }
+    ~SocketImpl() override { close(); }
 
+    // 禁用拷贝
     SocketImpl(const SocketImpl&) = delete;
     SocketImpl& operator=(const SocketImpl&) = delete;
 
-    // 移动构造 - 确保原对象完全失效
+    // 移动构造
     SocketImpl(SocketImpl&& other) noexcept
-        : fd_(other.fd_)
+        : io_handler_(std::move(other.io_handler_))
         , type_(other.type_)
+        , fd_(other.fd_)
         , is_connected_(other.is_connected_)
         , last_error_(other.last_error_) {
         other.fd_ = -1;
-        // other.type_ = SocketType::TCP;
         other.is_connected_ = false;
-        other.last_error_ = 0;
+        other.last_error_ = std::error_code();
     }
 
     // 移动赋值
     SocketImpl& operator=(SocketImpl&& other) noexcept {
         if (this != &other) {
-            // 释放当前资源
-            if (fd_ >= 0) {
-                ::close(fd_);
-            }
-            
-            // 转移所有权
-            fd_ = other.fd_;
+            close();
+            io_handler_ = std::move(other.io_handler_);
             type_ = other.type_;
+            fd_ = other.fd_;
             is_connected_ = other.is_connected_;
             last_error_ = other.last_error_;
-            
-            // 原对象放弃所有权
             other.fd_ = -1;
-            other.type_ = SocketType::TCP;
             other.is_connected_ = false;
-            other.last_error_ = 0;
+            other.last_error_ = std::error_code();
         }
         return *this;
     }
 
+    // ========== 基础操作 ==========
     bool bind(const NetAddress& addr) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-
         struct sockaddr_in sa;
         if (!netaddress_to_sockaddr_in(addr, sa)) {
-            last_error_ = errno;
+            last_error_ = std::error_code(errno, std::system_category());
             return false;
         }
-        
-        if (::bind(fd_, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) != 0) {
-            last_error_ = errno;
+        auto result = io_handler_->Bind(fd_, (sockaddr*)&sa, sizeof(sa));
+        if (!result) {
+            last_error_ = result.error();
             return false;
         }
-        
-        last_error_ = 0;
+        last_error_ = std::error_code();
         return true;
     }
 
     bool listen(int backlog) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-        
         if (type_ != SocketType::TCP) {
-            last_error_ = EOPNOTSUPP;
+            last_error_ = std::error_code(EOPNOTSUPP, std::system_category());
             return false;
         }
-        
-        // 可选：检查是否已绑定，如果未绑定则自动绑定
-        // 这里直接调用 listen，让系统决定（Linux 会自动绑定到随机端口）
-        if (::listen(fd_, backlog) != 0) {
-            last_error_ = errno;
+        auto result = io_handler_->Listen(fd_, backlog);
+        if (!result) {
+            last_error_ = result.error();
             return false;
         }
-        
-        last_error_ = 0;
+        last_error_ = std::error_code();
         return true;
     }
 
     std::unique_ptr<Socket> accept(NetAddress* peer_addr) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return nullptr;
         }
-        
         if (type_ != SocketType::TCP) {
-            last_error_ = EOPNOTSUPP;
+            last_error_ = std::error_code(EOPNOTSUPP, std::system_category());
             return nullptr;
         }
-
         struct sockaddr_in sa;
         socklen_t len = sizeof(sa);
-        int client_fd = ::accept(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len);
-        
-        if (client_fd < 0) {
-            last_error_ = errno;
+        auto result = io_handler_->Accept(fd_, (sockaddr*)&sa, &len);
+        if (!result) {
+            last_error_ = result.error();
             return nullptr;
         }
-        
+        int client_fd = result.value();
         if (peer_addr) {
             char ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
             *peer_addr = NetAddress(ip, ntohs(sa.sin_port));
         }
-        
-        last_error_ = 0;
-        return std::make_unique<SocketImpl>(client_fd, type_);
+        last_error_ = std::error_code();
+        return std::make_unique<SocketImpl>(client_fd, type_, io_handler_);
     }
 
     bool connect(const NetAddress& addr) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-
         struct sockaddr_in sa;
         if (!netaddress_to_sockaddr_in(addr, sa)) {
-            last_error_ = errno;
+            last_error_ = std::error_code(errno, std::system_category());
             return false;
         }
-        
-        int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
-        if (ret == 0) {
-            is_connected_ = true;
-            last_error_ = 0;
-            return true;
+        auto result = io_handler_->Connect(fd_, (sockaddr*)&sa, sizeof(sa));
+        if (!result) {
+            last_error_ = result.error();
+            if (last_error_ == std::error_code(EINPROGRESS, std::system_category())) {
+                return true;  // 非阻塞模式
+            }
+            return false;
         }
-        
-        last_error_ = errno;
-        
-        if (last_error_ == EINPROGRESS) {
-            return true;
-        }
-        
-        return false;
+        is_connected_ = true;
+        last_error_ = std::error_code();
+        return true;
     }
 
+    // ========== 数据读写 ==========
     ssize_t send(const void* data, size_t len) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return -1;
         }
-        
-        ssize_t ret = ::send(fd_, data, len, 0);
-        if (ret < 0) {
-            last_error_ = errno;
-        } else {
-            last_error_ = 0;
+        auto result = io_handler_->Send(fd_, data, len, 0);
+        if (!result) {
+            last_error_ = result.error();
+            return -1;
         }
-        return ret;
+        last_error_ = std::error_code();
+        return result.value();
     }
 
     ssize_t recv(void* buf, size_t len) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return -1;
         }
-        
-        ssize_t ret = ::recv(fd_, buf, len, 0);
-        if (ret < 0) {
-            last_error_ = errno;
-        } else {
-            last_error_ = 0;
+        auto result = io_handler_->Recv(fd_, buf, len, 0);
+        if (!result) {
+            last_error_ = result.error();
+            return -1;
         }
-        return ret;
+        last_error_ = std::error_code();
+        return result.value();
     }
 
     ssize_t sendto(const void* data, size_t len, const NetAddress& addr) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return -1;
         }
-        
         if (type_ != SocketType::UDP) {
-            last_error_ = EOPNOTSUPP;
+            last_error_ = std::error_code(EOPNOTSUPP, std::system_category());
             return -1;
         }
-        
         struct sockaddr_in sa;
         if (!netaddress_to_sockaddr_in(addr, sa)) {
-            last_error_ = errno;
+            last_error_ = std::error_code(errno, std::system_category());
             return -1;
         }
-        
-        ssize_t ret = ::sendto(fd_, data, len, 0,
-                               reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
-        if (ret < 0) {
-            last_error_ = errno;
-        } else {
-            last_error_ = 0;
+        auto result = io_handler_->SendTo(fd_, data, len, 0, (sockaddr*)&sa, sizeof(sa));
+        if (!result) {
+            last_error_ = result.error();
+            return -1;
         }
-        return ret;
+        last_error_ = std::error_code();
+        return result.value();
     }
 
     ssize_t recvfrom(void* buf, size_t len, NetAddress* src_addr) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return -1;
         }
-        
         if (type_ != SocketType::UDP) {
-            last_error_ = EOPNOTSUPP;
+            last_error_ = std::error_code(EOPNOTSUPP, std::system_category());
             return -1;
         }
-        
         struct sockaddr_in sa;
         socklen_t addrlen = sizeof(sa);
-        ssize_t n = ::recvfrom(fd_, buf, len, 0,
-                               reinterpret_cast<struct sockaddr*>(&sa), &addrlen);
-        
-        if (n < 0) {
-            last_error_ = errno;
-            return n;
+        auto result = io_handler_->RecvFrom(fd_, buf, len, 0, (sockaddr*)&sa, &addrlen);
+        if (!result) {
+            last_error_ = result.error();
+            return -1;
         }
-        
-        last_error_ = 0;
-        
-        if (n >= 0 && src_addr) {
+        ssize_t n = result.value();
+        if (src_addr && n >= 0) {
             char ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
             *src_addr = NetAddress(ip, ntohs(sa.sin_port));
         }
-        
+        last_error_ = std::error_code();
         return n;
     }
 
+    // ========== 配置参数 ==========
     bool set_nonblocking(bool nonblocking) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-        
-        int flags = ::fcntl(fd_, F_GETFL, 0);
-        if (flags < 0) {
-            last_error_ = errno;
+        auto result = io_handler_->SetNonBlocking(fd_, nonblocking);
+        if (!result) {
+            last_error_ = result.error();
             return false;
         }
-        
-        if (nonblocking) {
-            flags |= O_NONBLOCK;
-        } else {
-            flags &= ~O_NONBLOCK;
-        }
-        
-        if (::fcntl(fd_, F_SETFL, flags) != 0) {
-            last_error_ = errno;
-            return false;
-        }
-        
-        last_error_ = 0;
+        last_error_ = std::error_code();
         return true;
     }
 
     bool set_options(const SocketOptions& options) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-        
         bool success = true;
-        
-        if (!set_socket_option(fd_, SOL_SOCKET, SO_REUSEADDR, 
-                               static_cast<int>(options.reuse_addr))) {
-            last_error_ = errno;
+
+        // SO_REUSEADDR
+        if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_REUSEADDR,
+                                          &options.reuse_addr, sizeof(options.reuse_addr))) {
             success = false;
         }
-        
 #ifdef SO_REUSEPORT
-        if (!set_socket_option(fd_, SOL_SOCKET, SO_REUSEPORT,
-                               static_cast<int>(options.reuse_port))) {
-            last_error_ = errno;
+        if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_REUSEPORT,
+                                          &options.reuse_port, sizeof(options.reuse_port))) {
             success = false;
         }
 #endif
-        
         if (type_ == SocketType::TCP) {
-            if (!set_socket_option(fd_, IPPROTO_TCP, TCP_NODELAY,
-                                   static_cast<int>(options.tcp_no_delay))) {
-                last_error_ = errno;
+            if (!io_handler_->SetTcpNoDelay(fd_, options.tcp_no_delay)) {
                 success = false;
             }
         }
-        
-        if (!set_socket_option(fd_, SOL_SOCKET, SO_KEEPALIVE,
-                               static_cast<int>(options.keep_alive))) {
-            last_error_ = errno;
+        if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_KEEPALIVE,
+                                          &options.keep_alive, sizeof(options.keep_alive))) {
             success = false;
         }
-        
-        if (!set_timeout_option(fd_, SOL_SOCKET, SO_RCVTIMEO, options.recv_timeout_ms)) {
-            last_error_ = errno;
-            success = false;
+        if (options.recv_timeout_ms > 0) {
+            struct timeval tv;
+            tv.tv_sec = options.recv_timeout_ms / 1000;
+            tv.tv_usec = (options.recv_timeout_ms % 1000) * 1000;
+            if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
+                success = false;
+            }
         }
-        
-        if (!set_timeout_option(fd_, SOL_SOCKET, SO_SNDTIMEO, options.send_timeout_ms)) {
-            last_error_ = errno;
-            success = false;
+        if (options.send_timeout_ms > 0) {
+            struct timeval tv;
+            tv.tv_sec = options.send_timeout_ms / 1000;
+            tv.tv_usec = (options.send_timeout_ms % 1000) * 1000;
+            if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv))) {
+                success = false;
+            }
         }
-        
         if (options.recv_buffer_size > 0) {
-            if (!set_socket_option(fd_, SOL_SOCKET, SO_RCVBUF, options.recv_buffer_size)) {
-                last_error_ = errno;
+            if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_RCVBUF,
+                                              &options.recv_buffer_size, sizeof(options.recv_buffer_size))) {
                 success = false;
             }
         }
-        
         if (options.send_buffer_size > 0) {
-            if (!set_socket_option(fd_, SOL_SOCKET, SO_SNDBUF, options.send_buffer_size)) {
-                last_error_ = errno;
+            if (!io_handler_->SetSocketOption(fd_, SOL_SOCKET, SO_SNDBUF,
+                                              &options.send_buffer_size, sizeof(options.send_buffer_size))) {
                 success = false;
             }
         }
-        
+
         if (success) {
-            last_error_ = 0;
+            last_error_ = std::error_code();
+        } else {
+            last_error_ = io_handler_->GetLastSocketError();
         }
         return success;
     }
 
     bool get_option(int level, int optname, void* optval, socklen_t* optlen) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-        
-        if (::getsockopt(fd_, level, optname, optval, optlen) != 0) {
-            last_error_ = errno;
+        auto result = io_handler_->GetSocketOption(fd_, level, optname, optval, optlen);
+        if (!result) {
+            last_error_ = result.error();
             return false;
         }
-        
-        last_error_ = 0;
+        last_error_ = std::error_code();
         return true;
     }
 
     bool set_option(int level, int optname, const void* optval, socklen_t optlen) override {
         if (!is_valid()) {
-            last_error_ = EBADF;
+            last_error_ = std::error_code(EBADF, std::system_category());
             return false;
         }
-        
-        if (::setsockopt(fd_, level, optname, optval, optlen) != 0) {
-            last_error_ = errno;
+        auto result = io_handler_->SetSocketOption(fd_, level, optname, optval, optlen);
+        if (!result) {
+            last_error_ = result.error();
             return false;
         }
-        
-        last_error_ = 0;
+        last_error_ = std::error_code();
         return true;
     }
 
+    // ========== 状态查询 ==========
     int fd() const override { return fd_; }
-    
     bool is_valid() const override { return fd_ >= 0; }
-    
+
     NetAddress local_address() const override {
         if (!is_valid()) return NetAddress();
-        
-        struct sockaddr_in sa;
-        socklen_t len = sizeof(sa);
-        if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len) != 0) {
-            return NetAddress();
-        }
-        
+        auto result = io_handler_->GetLocalAddress(fd_);
+        if (!result) return NetAddress();
+        const auto& sa = result.value();
         char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
-        return NetAddress(ip, ntohs(sa.sin_port));
+        inet_ntop(AF_INET, &sa.addr.sin_addr, ip, sizeof(ip));
+        return NetAddress(ip, ntohs(sa.addr.sin_port));
     }
 
     NetAddress peer_address() const override {
         if (!is_valid()) return NetAddress();
-        
-        struct sockaddr_in sa;
-        socklen_t len = sizeof(sa);
-        if (::getpeername(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len) != 0) {
-            return NetAddress();
-        }
-        
+        auto result = io_handler_->GetPeerAddress(fd_);
+        if (!result) return NetAddress();
+        const auto& sa = result.value();
         char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
-        return NetAddress(ip, ntohs(sa.sin_port));
+        inet_ntop(AF_INET, &sa.addr.sin_addr, ip, sizeof(ip));
+        return NetAddress(ip, ntohs(sa.addr.sin_port));
     }
 
     SocketType type() const override { return type_; }
 
     void close() override {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io_handler_->CloseSocket(fd_);
             fd_ = -1;
+            is_connected_ = false;
+            last_error_ = std::error_code();
         }
-        is_connected_ = false;
-        last_error_ = 0;
     }
 
     int get_error() const override {
-        if (last_error_ != 0) {
-            return last_error_;
+        if (last_error_.value() != 0) {
+            return last_error_.value();
         }
-        
         if (!is_valid()) return EBADF;
-        
         int error = 0;
         socklen_t len = sizeof(error);
         if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
@@ -531,18 +444,22 @@ public:
     }
 
 private:
-    int fd_;
+    std::shared_ptr<core::IIOHandler> io_handler_;
     SocketType type_;
+    int fd_;
     bool is_connected_;
-    mutable int last_error_;
+    mutable std::error_code last_error_;
 };
 
+// ========== 工厂函数 ==========
 std::unique_ptr<Socket> create_socket(SocketType type) {
-    return std::make_unique<SocketImpl>(type);
+    auto io_handler = core::IIOHandler::CreateDefault();
+    return std::make_unique<SocketImpl>(type, std::move(io_handler));
 }
 
 std::unique_ptr<Socket> create_socket_from_fd(int fd, SocketType type) {
-    return std::make_unique<SocketImpl>(fd, type);
+    auto io_handler = core::IIOHandler::CreateDefault();
+    return std::make_unique<SocketImpl>(fd, type, std::move(io_handler));
 }
 
 } // namespace httpserver::net

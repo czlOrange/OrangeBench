@@ -15,6 +15,11 @@ g++ -std=c++17 \
     src/application/http/http_request.cpp \
     src/application/websocket/websocket_session.cpp \
     src/application/websocket/websocket_frame.cpp \
+    src/application/websocket/speedtest_ws_handler.cpp \
+    src/application/http/http_protocol_handler.cpp \
+    src/application/http/handler/SpeedTestApi.cpp \
+    src/application/http/handler/AdminPageHandler.cpp \
+    src/application/http/http_route_config.cpp \
     src/core/net/io_handler.cpp \
     src/core/Event/event_dispatcher.cpp \
     src/core/Tcp/tcp_connection.cpp \
@@ -31,8 +36,8 @@ g++ -std=c++17 \
     src/core/Async/async_scheduler_impl.cpp \
     src/core/Async/async_utils.cpp \
     src/infrastructure/database.cpp \
-    src/application/http/http_protocol_handler.cpp\
-    -lsqlite3 -lssl -lcrypto -lpthread \
+    -lsqlite3 \
+    -lssl -lcrypto -lpthread \
     -o examples/build/http_server_example
 
 if [ $? -eq 0 ]; then

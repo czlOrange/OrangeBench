@@ -1,7 +1,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include "../Event/event_dispatcher.hpp"
+#include "core/Event/event_dispatcher.hpp"
 #include "connection_interface.hpp"
 
 namespace httpserver::core {

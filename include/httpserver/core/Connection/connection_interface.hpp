@@ -2,9 +2,10 @@
 #pragma once
 
 #include "connection_state.hpp"
-#include "core/net/io_handler.hpp"      // 提供 Result<T> 定义
-#include "core/Buffer/buffer_manager.hpp"
-#include "core/Async/async_operation.hpp"
+#include "core/net/socket.hpp"          // 封装系统调用,让数据能够在用户态和内核态交互
+#include "core/net/io_handler.hpp"       // 负责底层网络IO操作的接口
+#include "core/Buffer/buffer_manager.hpp"   // 让数据在用户态进行管理，减少内核态交互
+#include "core/Async/async_operation.hpp"   
 #include "core/Async/async_scheduler.hpp"
 #include "core/Event/event_dispatcher.hpp"
 #include <memory>
@@ -14,7 +15,7 @@
 #include <future>
 #include <functional>
 #include <unordered_map>
-
+#include <expected>
 namespace httpserver::core {
 
 // 前向声明
@@ -117,7 +118,7 @@ public:
     
     // 工厂方法
     static std::shared_ptr<IConnection> Create(
-        std::shared_ptr<IIOHandler> io_handler,
+        std::unique_ptr<net::Socket> socket,           // ← 直接接受 Socket
         std::shared_ptr<IBufferManager> buffer_manager,
         std::shared_ptr<async::IScheduler> scheduler,
         std::shared_ptr<IEventDispatcher> dispatcher);

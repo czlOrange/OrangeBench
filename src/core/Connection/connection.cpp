@@ -1,6 +1,7 @@
 // src/httpserver/core/connections/connection.cpp
-#include "httpserver/core/Connection/connection_interface.hpp"
-#include "Component/buffer_manager.cpp"   // 包含组件实现（因为无头文件）
+#include "core/Connection/connection_interface.hpp"
+#include "core/net/socket.hpp"          // ✅ 唯一的网络抽象层
+#include "Component/buffer_manager.cpp"
 #include "Component/event_manager.cpp"
 #include "Component/heartbeat.cpp"
 #include "Component/identity.cpp"
@@ -14,87 +15,54 @@
 
 namespace httpserver::core {
 
-// 辅助错误码生成 
 static std::error_code make_error_code(ConnectionError err) {
     return std::error_code(static_cast<int>(err), std::generic_category());
 }
 
 class TcpConnection : public IConnection, public std::enable_shared_from_this<TcpConnection> {
 public:
-    TcpConnection(std::shared_ptr<IIOHandler> io_handler,
+    // ✅ 构造函数直接接受 Socket，不再有 IIOHandler 参数
+    TcpConnection(std::unique_ptr<net::Socket> socket,
                   std::shared_ptr<IBufferManager> buffer_mgr,
                   std::shared_ptr<async::IScheduler> scheduler,
                   std::shared_ptr<IEventDispatcher> dispatcher)
-        : io_handler_(std::move(io_handler))
+        : socket_(std::move(socket))
         , buffer_mgr_(std::move(buffer_mgr))
         , scheduler_(std::move(scheduler))
         , event_manager_(std::move(dispatcher))
-        , fd_(-1)
         , config_()
     {
-        if (!io_handler_) io_handler_ = IIOHandler::CreateDefault();
+        if (!socket_) {
+            throw std::invalid_argument("Socket cannot be null");
+        }
         if (!buffer_mgr_) buffer_mgr_ = IBufferManager::CreateDefault();
         if (!scheduler_) scheduler_ = async::IScheduler::CreateDefault();
         if (!event_manager_.GetDispatcher()) {
             event_manager_ = EventManager(IEventDispatcher::CreateDefault());
         }
+        
+        // 应用默认配置到 socket
+        applyConfigToSocket();
     }
 
     ~TcpConnection() override { Close(); }
 
     // ---------- 生命周期 ----------
     std::error_code Connect(const std::string& host, uint16_t port) override {
-        auto addr = SocketAddress::FromIpPort(host, port);
-        return Connect(addr);
+        net::NetAddress addr(host, port);
+        return ConnectInternal(addr);
     }
 
     std::error_code Connect(const SocketAddress& addr) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (state_machine_.GetState() != ConnectionState::DISCONNECTED) {
-            return make_error_code(ConnectionError::ALREADY_CONNECTED);
-        }
-        auto fd_res = io_handler_->CreateSocket(AF_INET, SOCK_STREAM, 0);
-        if (fd_res.has_error()) return fd_res.error();
-        fd_ = fd_res.value();
-
-        auto set_nonblock = io_handler_->SetNonBlocking(fd_, true);
-        if (set_nonblock.has_error()) {
-            io_handler_->CloseSocket(fd_);
-            fd_ = -1;
-            return set_nonblock.error();
-        }
-        if (config_.no_delay) {
-            io_handler_->SetTcpNoDelay(fd_, true);
-        }
-
-        auto connect_res = io_handler_->Connect(fd_, reinterpret_cast<const sockaddr*>(&addr.addr), addr.len);
-        if (connect_res.has_error()) {
-            if (connect_res.error().value() != EINPROGRESS) {
-                io_handler_->CloseSocket(fd_);
-                fd_ = -1;
-                return connect_res.error();
-            }
-            state_machine_.SetConnecting();
-            auto weak_self = weak_from_this();
-            event_manager_.RegisterWrite(fd_, [weak_self]() {
-                if (auto self = weak_self.lock()) {
-                    static_cast<TcpConnection*>(self.get())->onConnectComplete();
-                }
-            });
-            return std::error_code();
-        } else {
-            state_machine_.SetConnected();
-            stats_.SetConnectTime(std::chrono::steady_clock::now());
-            updateActivity();
-            registerReadEvent();
-            event_manager_.NotifyEvent(ConnectionEvent::CONNECTED, shared_from_this(), "");
-            return std::error_code();
-        }
+        net::NetAddress net_addr(addr.GetIp(), addr.GetPort());
+        return ConnectInternal(net_addr);
     }
 
     std::error_code Disconnect() noexcept override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_machine_.GetState() == ConnectionState::DISCONNECTED) return std::error_code();
+        if (state_machine_.GetState() == ConnectionState::DISCONNECTED) {
+            return std::error_code();
+        }
         state_machine_.SetDisconnecting();
         closeInternal();
         return std::error_code();
@@ -115,22 +83,24 @@ public:
         if (!state_machine_.IsConnected()) {
             return std::unexpected(make_error_code(ConnectionError::NOT_CONNECTED));
         }
-        auto result = io_handler_->Send(fd_, data, len, 0);
-        if (result.has_error()) {
-            auto err = result.error();
-            if (err.value() == EAGAIN || err.value() == EWOULDBLOCK) {
+        
+        ssize_t sent = socket_->send(data, len);
+        if (sent < 0) {
+            int err = socket_->get_error();
+            if (err == EAGAIN || err == EWOULDBLOCK) {
                 if (!send_queue_.EnqueueSend({static_cast<const char*>(data), len})) {
                     return std::unexpected(make_error_code(ConnectionError::SEND_QUEUE_FULL));
                 }
                 registerWriteEvent();
                 return len;
             }
-            return std::unexpected(err);
+            return std::unexpected(std::error_code(err, std::system_category()));
         }
-        stats_.RecordSent(result.value());
+        
+        stats_.RecordSent(static_cast<size_t>(sent));
         stats_.RecordOperation();
         updateActivity();
-        return result.value();
+        return static_cast<size_t>(sent);
     }
 
     std::expected<std::string, std::error_code> Receive(size_t max_len) override {
@@ -138,21 +108,23 @@ public:
         if (!state_machine_.IsConnected()) {
             return std::unexpected(make_error_code(ConnectionError::NOT_CONNECTED));
         }
+        
         std::string buffer(max_len, '\0');
-        auto result = io_handler_->Recv(fd_, buffer.data(), max_len, 0);
-        if (result.has_error()) {
-            auto err = result.error();
-            if (err.value() == EAGAIN || err.value() == EWOULDBLOCK) {
+        ssize_t recvd = socket_->recv(buffer.data(), max_len);
+        if (recvd < 0) {
+            int err = socket_->get_error();
+            if (err == EAGAIN || err == EWOULDBLOCK) {
                 return std::unexpected(make_error_code(ConnectionError::WOULD_BLOCK));
             }
-            return std::unexpected(err);
+            return std::unexpected(std::error_code(err, std::system_category()));
         }
-        if (result.value() == 0) {
+        if (recvd == 0) {
             closeInternal();
             return std::unexpected(make_error_code(ConnectionError::CONNECTION_RESET));
         }
-        buffer.resize(result.value());
-        stats_.RecordReceived(result.value());
+        
+        buffer.resize(static_cast<size_t>(recvd));
+        stats_.RecordReceived(static_cast<size_t>(recvd));
         stats_.RecordOperation();
         updateActivity();
         return buffer;
@@ -163,22 +135,24 @@ public:
         if (!state_machine_.IsConnected()) {
             return std::unexpected(make_error_code(ConnectionError::NOT_CONNECTED));
         }
-        auto result = io_handler_->Recv(fd_, buffer, len, 0);
-        if (result.has_error()) {
-            auto err = result.error();
-            if (err.value() == EAGAIN || err.value() == EWOULDBLOCK) {
+        
+        ssize_t recvd = socket_->recv(buffer, len);
+        if (recvd < 0) {
+            int err = socket_->get_error();
+            if (err == EAGAIN || err == EWOULDBLOCK) {
                 return std::unexpected(make_error_code(ConnectionError::WOULD_BLOCK));
             }
-            return std::unexpected(err);
+            return std::unexpected(std::error_code(err, std::system_category()));
         }
-        if (result.value() == 0) {
+        if (recvd == 0) {
             closeInternal();
             return std::unexpected(make_error_code(ConnectionError::CONNECTION_RESET));
         }
-        stats_.RecordReceived(result.value());
+        
+        stats_.RecordReceived(static_cast<size_t>(recvd));
         stats_.RecordOperation();
         updateActivity();
-        return result.value();
+        return static_cast<size_t>(recvd);
     }
 
     // ---------- 异步数据 ----------
@@ -227,24 +201,29 @@ public:
         if (!state_machine_.IsConnected()) {
             return make_error_code(ConnectionError::NOT_CONNECTED);
         }
+        
         while (!send_queue_.IsSendQueueEmpty()) {
             auto view = send_queue_.PeekSend();
             if (view.size == 0) break;
-            auto result = io_handler_->Send(fd_, view.data, view.size, 0);
-            if (result.has_error()) {
-                if (result.error().value() == EAGAIN || result.error().value() == EWOULDBLOCK) {
+            
+            ssize_t sent = socket_->send(view.data, view.size);
+            if (sent < 0) {
+                int err = socket_->get_error();
+                if (err == EAGAIN || err == EWOULDBLOCK) {
                     registerWriteEvent();
                     break;
                 }
-                return result.error();
+                return std::error_code(err, std::system_category());
             }
-            send_queue_.ConsumeSend(result.value());
-            stats_.RecordSent(result.value());
+            
+            send_queue_.ConsumeSend(static_cast<size_t>(sent));
+            stats_.RecordSent(static_cast<size_t>(sent));
             stats_.RecordOperation();
             updateActivity();
         }
+        
         if (send_queue_.IsSendQueueEmpty()) {
-            event_manager_.ModifyToReadOnly(fd_);
+            event_manager_.ModifyToReadOnly(socket_->fd());
         }
         return std::error_code();
     }
@@ -269,9 +248,7 @@ public:
     void Configure(const ConnectionConfig& config) override {
         std::lock_guard<std::mutex> lock(mutex_);
         config_ = config;
-        if (fd_ != -1) {
-            io_handler_->SetTcpNoDelay(fd_, config_.no_delay);
-        }
+        applyConfigToSocket();
     }
 
     ConnectionConfig GetConfig() const override {
@@ -282,9 +259,7 @@ public:
     void UpdateConfig(std::function<void(ConnectionConfig&)> updater) override {
         std::lock_guard<std::mutex> lock(mutex_);
         updater(config_);
-        if (fd_ != -1) {
-            io_handler_->SetTcpNoDelay(fd_, config_.no_delay);
-        }
+        applyConfigToSocket();
     }
 
     // ---------- 状态 ----------
@@ -300,16 +275,12 @@ public:
 
     bool IsReadable() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return false;
-        auto res = io_handler_->PollRead(fd_, 0);
-        return res.has_value() && res.value();
+        return socket_->is_valid() && state_machine_.IsConnected();
     }
 
     bool IsWritable() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return false;
-        auto res = io_handler_->PollWrite(fd_, 0);
-        return res.has_value() && res.value();
+        return socket_->is_valid() && state_machine_.IsConnected();
     }
 
     bool HasError() const override {
@@ -320,44 +291,36 @@ public:
     // ---------- 地址 ----------
     std::string GetLocalAddress() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return "";
-        auto addr = io_handler_->GetLocalAddress(fd_);
-        return addr ? addr->ToString() : "";
+        return socket_->is_valid() ? socket_->local_address().to_string() : "";
     }
 
     std::string GetPeerAddress() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return "";
-        auto addr = io_handler_->GetPeerAddress(fd_);
-        return addr ? addr->ToString() : "";
+        return socket_->is_valid() ? socket_->peer_address().to_string() : "";
     }
 
     uint16_t GetLocalPort() const noexcept override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return 0;
-        auto addr = io_handler_->GetLocalAddress(fd_);
-        return addr ? addr->GetPort() : 0;
+        return socket_->is_valid() ? socket_->local_address().port() : 0;
     }
 
     uint16_t GetPeerPort() const noexcept override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return 0;
-        auto addr = io_handler_->GetPeerAddress(fd_);
-        return addr ? addr->GetPort() : 0;
+        return socket_->is_valid() ? socket_->peer_address().port() : 0;
     }
 
     SocketAddress GetLocalSocketAddress() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return SocketAddress();
-        auto addr = io_handler_->GetLocalAddress(fd_);
-        return addr ? *addr : SocketAddress();
+        if (!socket_->is_valid()) return SocketAddress();
+        auto addr = socket_->local_address();
+        return SocketAddress(addr.ip(), addr.port());
     }
 
     SocketAddress GetPeerSocketAddress() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return SocketAddress();
-        auto addr = io_handler_->GetPeerAddress(fd_);
-        return addr ? *addr : SocketAddress();
+        if (!socket_->is_valid()) return SocketAddress();
+        auto addr = socket_->peer_address();
+        return SocketAddress(addr.ip(), addr.port());
     }
 
     // ---------- 统计 ----------
@@ -388,23 +351,19 @@ public:
 
     // ---------- 等待 ----------
     bool WaitForData(std::chrono::milliseconds timeout) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return false;
-        auto res = io_handler_->PollRead(fd_, static_cast<int>(timeout.count()));
-        return res.has_value() && res.value();
+        // TODO: 通过 EventManager 实现真正的超时等待
+        return IsReadable();
     }
 
     bool WaitForWritable(std::chrono::milliseconds timeout) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (fd_ == -1) return false;
-        auto res = io_handler_->PollWrite(fd_, static_cast<int>(timeout.count()));
-        return res.has_value() && res.value();
+        // TODO: 通过 EventManager 实现真正的超时等待
+        return IsWritable();
     }
 
     // ---------- 文件描述符 ----------
     int GetFd() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return fd_;
+        return socket_->fd();
     }
 
     // ---------- 回调 ----------
@@ -477,12 +436,56 @@ public:
     }
 
 private:
-    // 内部辅助函数
+    std::error_code ConnectInternal(const net::NetAddress& addr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        if (state_machine_.GetState() != ConnectionState::DISCONNECTED) {
+            return make_error_code(ConnectionError::ALREADY_CONNECTED);
+        }
+        
+        if (!socket_->is_valid()) {
+            // 如果 socket 无效，重新创建
+            socket_ = net::create_socket(net::SocketType::TCP);
+            applyConfigToSocket();
+        }
+        
+        socket_->set_nonblocking(true);
+        
+        if (!socket_->connect(addr)) {
+            int err = socket_->get_error();
+            if (err == EINPROGRESS) {
+                state_machine_.SetConnecting();
+                auto weak_self = weak_from_this();
+                event_manager_.RegisterWrite(socket_->fd(), [weak_self]() {
+                    if (auto self = weak_self.lock()) {
+                        static_cast<TcpConnection*>(self.get())->onConnectComplete();
+                    }
+                });
+                return std::error_code();
+            }
+            return std::error_code(err, std::system_category());
+        }
+        
+        state_machine_.SetConnected();
+        stats_.SetConnectTime(std::chrono::steady_clock::now());
+        updateActivity();
+        registerReadEvent();
+        event_manager_.NotifyEvent(ConnectionEvent::CONNECTED, shared_from_this(), "");
+        return std::error_code();
+    }
+
+    void applyConfigToSocket() {
+        net::SocketOptions opts;
+        opts.tcp_no_delay = config_.no_delay;
+        opts.keep_alive = config_.keep_alive;
+        opts.reuse_addr = true;
+        socket_->set_options(opts);
+    }
+
     void closeInternal() {
-        if (fd_ != -1) {
-            event_manager_.Unregister(fd_);
-            io_handler_->CloseSocket(fd_);
-            fd_ = -1;
+        if (socket_->is_valid()) {
+            event_manager_.Unregister(socket_->fd());
+            socket_->close();
         }
         state_machine_.SetDisconnected();
         send_queue_.ClearAll();
@@ -492,7 +495,7 @@ private:
 
     void registerReadEvent() {
         auto weak_self = weak_from_this();
-        event_manager_.RegisterRead(fd_, [weak_self]() {
+        event_manager_.RegisterRead(socket_->fd(), [weak_self]() {
             if (auto self = weak_self.lock()) {
                 static_cast<TcpConnection*>(self.get())->onReadEvent();
             }
@@ -501,7 +504,7 @@ private:
 
     void registerWriteEvent() {
         auto weak_self = weak_from_this();
-        event_manager_.RegisterWrite(fd_, [weak_self]() {
+        event_manager_.RegisterWrite(socket_->fd(), [weak_self]() {
             if (auto self = weak_self.lock()) {
                 static_cast<TcpConnection*>(self.get())->onWriteEvent();
             }
@@ -511,9 +514,8 @@ private:
     void onConnectComplete() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_machine_.GetState() == ConnectionState::CONNECTING) {
-            int error = 0;
-            socklen_t len = sizeof(error);
-            if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+            int err = socket_->get_error();
+            if (err == 0) {
                 state_machine_.SetConnected();
                 stats_.SetConnectTime(std::chrono::steady_clock::now());
                 updateActivity();
@@ -521,7 +523,7 @@ private:
                 event_manager_.NotifyEvent(ConnectionEvent::CONNECTED, shared_from_this(), "");
             } else {
                 state_machine_.SetError();
-                event_manager_.NotifyError(shared_from_this(), make_error_code(ConnectionError::CONNECT_FAILED));
+                event_manager_.NotifyError(shared_from_this(), std::error_code(err, std::system_category()));
             }
         }
     }
@@ -529,55 +531,59 @@ private:
     void onReadEvent() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!state_machine_.IsConnected()) return;
-
+        
         auto region = receive_buffer_.GetReceiveBuffer();
         if (region.size == 0) return;
-        auto result = io_handler_->Recv(fd_, const_cast<char*>(region.data), region.size, 0);
-        if (result.has_error()) {
-            auto err = result.error();
-            if (err.value() == EAGAIN || err.value() == EWOULDBLOCK) return;
+        
+        ssize_t recvd = socket_->recv(const_cast<char*>(region.data), region.size);
+        if (recvd < 0) {
+            int err = socket_->get_error();
+            if (err == EAGAIN || err == EWOULDBLOCK) return;
             closeInternal();
-            event_manager_.NotifyError(shared_from_this(), err);
+            event_manager_.NotifyError(shared_from_this(), std::error_code(err, std::system_category()));
             return;
         }
-        if (result.value() == 0) {
+        if (recvd == 0) {
             closeInternal();
             event_manager_.NotifyEvent(ConnectionEvent::DISCONNECTED, shared_from_this(), "");
             return;
         }
-        receive_buffer_.CommitReceive(result.value());
-        stats_.RecordReceived(result.value());
+        
+        receive_buffer_.CommitReceive(static_cast<size_t>(recvd));
+        stats_.RecordReceived(static_cast<size_t>(recvd));
         stats_.RecordOperation();
         updateActivity();
-
-        auto read_view = receive_buffer_.GetReceiveBuffer(); // 注意：这里得到的是整个可读区域，实际应返回已提交的数据
-        // 简化：直接通知全部可读数据（生产环境中可能需要更精细控制）
+        
+        auto read_view = receive_buffer_.GetReceiveBuffer();
         event_manager_.NotifyData(shared_from_this(), std::string_view(read_view.data, receive_buffer_.GetReceiveBufferSize()));
     }
 
     void onWriteEvent() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!state_machine_.IsConnected()) return;
-
+        
         while (!send_queue_.IsSendQueueEmpty()) {
             auto view = send_queue_.PeekSend();
             if (view.size == 0) break;
-            auto result = io_handler_->Send(fd_, view.data, view.size, 0);
-            if (result.has_error()) {
-                auto err = result.error();
-                if (err.value() == EAGAIN || err.value() == EWOULDBLOCK) return;
+            
+            ssize_t sent = socket_->send(view.data, view.size);
+            if (sent < 0) {
+                int err = socket_->get_error();
+                if (err == EAGAIN || err == EWOULDBLOCK) return;
                 closeInternal();
-                event_manager_.NotifyError(shared_from_this(), err);
+                event_manager_.NotifyError(shared_from_this(), std::error_code(err, std::system_category()));
                 return;
             }
-            send_queue_.ConsumeSend(result.value());
-            stats_.RecordSent(result.value());
+            
+            send_queue_.ConsumeSend(static_cast<size_t>(sent));
+            stats_.RecordSent(static_cast<size_t>(sent));
             stats_.RecordOperation();
             updateActivity();
             event_manager_.NotifyEvent(ConnectionEvent::DATA_SENT, shared_from_this(), "");
         }
+        
         if (send_queue_.IsSendQueueEmpty()) {
-            event_manager_.ModifyToReadOnly(fd_);
+            event_manager_.ModifyToReadOnly(socket_->fd());
         }
     }
 
@@ -586,12 +592,12 @@ private:
         heartbeat_.Update();
     }
 
-    // 成员变量
+    // ✅ 成员变量：彻底移除了 IIOHandler
     mutable std::mutex mutex_;
-    std::shared_ptr<IIOHandler> io_handler_;
+    std::unique_ptr<net::Socket> socket_;  // ✅ 唯一的网络抽象层
     std::shared_ptr<IBufferManager> buffer_mgr_;
     std::shared_ptr<async::IScheduler> scheduler_;
-
+    
     SendBufferQueue send_queue_;
     ReceiveBuffer receive_buffer_;
     EventManager event_manager_;
@@ -600,19 +606,19 @@ private:
     StateMachine state_machine_;
     Statistics stats_;
     UserData user_data_;
-
-    int fd_;
+    
     ConnectionConfig config_;
 };
 
-// 工厂方法
+// ✅ 新的工厂方法：只接受 Socket，不再接受 IIOHandler
 std::shared_ptr<IConnection> IConnection::Create(
-    std::shared_ptr<IIOHandler> io_handler,
+    std::unique_ptr<net::Socket> socket,
     std::shared_ptr<IBufferManager> buffer_manager,
     std::shared_ptr<async::IScheduler> scheduler,
     std::shared_ptr<IEventDispatcher> dispatcher) {
+    
     return std::make_shared<TcpConnection>(
-        std::move(io_handler),
+        std::move(socket),
         std::move(buffer_manager),
         std::move(scheduler),
         std::move(dispatcher));

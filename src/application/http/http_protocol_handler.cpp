@@ -1,12 +1,10 @@
 // src/application/http/http_protocol_handler.cpp
-#include "application/http/http_protocol_handler.hpp"
-#include "application/http/http_request.hpp"
-#include "application/http/http_response.hpp"
-#include "application/http/http_parser.hpp"
+#include "httpserver/application/http/http_protocol_handler.hpp"
+#include "httpserver/application/http/http_request.hpp"
+#include "httpserver/application/http/http_response.hpp"
+#include "httpserver/application/websocket/speedtest_ws_handler.hpp"
 #include "core/Event/event_dispatcher.hpp"
 #include "core/Connection/connection_interface.hpp"
-#include "application/websocket/websocket_session.hpp"
-#include "application/websocket/websocket_frame.hpp"
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -15,10 +13,12 @@
 #include <thread>
 #include <chrono>
 #include <iostream>
-#include <cstring>    // 解决 strchr
-#include <cstdio>     // 解决 strerror
-#include <errno.h>    // 解决 errno
+#include <cstring>
+#include <cstdio>
+#include <errno.h>
+#include "httpserver/application/websocket/speedtest_ws_handler.hpp"
 namespace fs = std::filesystem;
+
 namespace httpserver::application::http {
 
 // ============================================================================
@@ -40,8 +40,6 @@ HttpProtocolHandler::~HttpProtocolHandler() {
 void HttpProtocolHandler::Start() {
     if (running_) return;
     running_ = true;
-
-    // 启动清理线程
     cleanup_thread_ = std::make_unique<std::thread>([this]() {
         while (running_) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -94,92 +92,71 @@ void HttpProtocolHandler::AddMiddleware(Middleware middleware) {
 // ============================================================================
 
 void HttpProtocolHandler::OnData(std::shared_ptr<core::IConnection> conn, std::string_view data) {
-    std::cout << "🔥 OnData called, size=" << data.size() << std::endl;
     if (!conn || !running_) return;
     
-    std::string request_str(data.data(), data.size());
-    if (data.size() > 0) {
-        std::string preview(data.data(), std::min(data.size(), (size_t)200));
-        std::cout << "📋 Preview: " << preview << std::endl;
-    }
-    
-    if (request_str.find("Upgrade: websocket") != std::string::npos) {
-        std::cout << "🔌 WebSocket upgrade detected!" << std::endl;
-        std::cout << "📋 Full request head:\n" << request_str.substr(0, 500) << std::endl;
-        
-        std::string key;
-        size_t key_pos = request_str.find("Sec-WebSocket-Key:");
-        if (key_pos != std::string::npos) {
-            size_t start = key_pos + 19;
-            size_t end = request_str.find("\r\n", start);
-            if (end != std::string::npos) {
-                key = request_str.substr(start, end - start);
-                key.erase(0, key.find_first_not_of(" \t"));
-                key.erase(key.find_last_not_of(" \t") + 1);
-            }
-        }
-        std::cout << "🔑 Extracted key: [" << key << "]" << std::endl;
-        
-        if (!key.empty()) {
-            std::string response = websocket::WebSocketSession::HandshakeResponse(key);
-            conn->Send(response);
-            std::cout << "✅ WebSocket handshake sent" << std::endl;
-            
-            // 启动测速数据发送线程
-        std::thread([conn]() {
-            std::cout << "📤 Data sending thread started" << std::endl;
-            const size_t chunk_size = 64 * 1024;  // 64KB
-            std::vector<uint8_t> test_data(chunk_size, 0xAA);
-            auto start_time = std::chrono::steady_clock::now();
-            const int duration_seconds = 10;
-            
-            while (true) {
-                auto frame = websocket::FrameCodec::EncodeBinary(test_data);
-                auto result = conn->Send(std::string_view(reinterpret_cast<const char*>(frame.data()), frame.size()));
-                
-                if (result.has_error()) {
-                    std::error_code ec = result.error();
-                    if (ec == std::errc::resource_unavailable_try_again || ec == std::errc::operation_would_block) {
-                        // 发送缓冲区满，等待 1ms 后重试
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        continue;  // 重试当前帧
-                    } else {
-                        std::cerr << "WebSocket send error: " << ec.message() << std::endl;
-                        break;
-                    }
-                }
-                
-                // 检查是否达到持续时间
-                auto elapsed = std::chrono::steady_clock::now() - start_time;
-                if (elapsed >= std::chrono::seconds(duration_seconds)) {
-                    break;
-                }
-                
-                // 正常发送后不加 sleep，让 TCP 尽可能快发送
-                // 如果担心 CPU 占用过高，可加极短延时，但会影响测速上限
-                // std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            
-            auto close_frame = websocket::FrameCodec::EncodeClose(1000, "Test finished");
-            conn->Send(std::string_view(reinterpret_cast<const char*>(close_frame.data()), close_frame.size()));
-            std::cout << "📊 Speed test data transmission completed" << std::endl;
-        }).detach();
-        } else {
-            std::cout << "❌ WebSocket key is empty, cannot handshake!" << std::endl;
-        }
-        return;
-    }
-    
-    // HTTP 解析逻辑（保持不变）
     uint64_t conn_id = conn->GetConnectionId();
     auto& ctx = GetContext(conn_id);
     ctx.last_activity = std::chrono::steady_clock::now();
     ctx.buffer.append(data.data(), data.size());
-    
+
+    // 检查是否为 WebSocket 升级（仅当缓冲区包含完整请求头）
+    size_t header_end = ctx.buffer.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+        std::string header_part = ctx.buffer.substr(0, header_end);
+        
+        // 检查是否是 WebSocket 升级请求
+        if (header_part.find("Upgrade: websocket") != std::string::npos ||
+            header_part.find("Upgrade: WebSocket") != std::string::npos) {
+            
+            // 使用临时上下文解析，避免破坏原始缓冲区
+            ConnectionHttpContext temp_ctx = ctx;
+            HttpRequest temp_req;
+            
+            if (ParseHttpRequest(temp_ctx, temp_req)) {
+                std::string upgrade_header = temp_req.GetHeader("Upgrade");
+                std::transform(upgrade_header.begin(), upgrade_header.end(), 
+                               upgrade_header.begin(), ::tolower);
+                
+                // 在 OnData 函数中，WebSocket 升级处理部分
+                if (upgrade_header == "websocket" && temp_req.GetPath() == "/ws/speedtest") {
+                    std::cout << "🔌 WebSocket upgrade detected for conn " << conn_id << std::endl;
+                    
+                    // 计算需要消费的字节数
+                    size_t content_length = 0;
+                    std::string cl_str = temp_req.GetHeader("Content-Length");
+                    if (!cl_str.empty()) content_length = std::stoul(cl_str);
+                    size_t consumed = header_end + 4 + content_length;
+                    
+                    // 直接从原始缓冲区删除已解析部分
+                    ctx.buffer.erase(0, consumed);
+                    
+                    // 获取 Sec-WebSocket-Key
+                    std::string key = temp_req.GetHeader("Sec-WebSocket-Key");
+                    if (!key.empty()) {
+                        // 委托给专门的测速 WebSocket 处理器（注意命名空间）
+                        //auto ws_session = websocket::SpeedTestWebSocketHandler::CreateAndHandle(conn, key, conn_id);
+                        auto ws_session = httpserver::application::websocket::SpeedTestWebSocketHandler::CreateAndHandle(conn, key, conn_id);
+                        if (ws_session) {
+                            conn->SetDataCallback([ws_session](std::shared_ptr<core::IConnection> c, std::string_view d) {
+                                ws_session->OnData(d);
+                            });
+                            RemoveContext(conn_id);
+                            return;
+                        }
+                    }
+                    // 握手失败，关闭连接
+                    conn->Close();
+                    RemoveContext(conn_id);
+                    return;
+                }
+            }
+        }
+    }
+
+    // 普通 HTTP 处理
     while (!ctx.buffer.empty()) {
         HttpRequest req;
         if (!ParseHttpRequest(ctx, req)) {
-            std::cout << "⚠️ ParseHttpRequest incomplete, waiting for more data" << std::endl;
             break;
         }
         std::cout << "✅ Parsed request: " << req.GetMethod() << " " << req.GetPath() << std::endl;
@@ -194,118 +171,22 @@ void HttpProtocolHandler::OnData(std::shared_ptr<core::IConnection> conn, std::s
     }
 }
 
-
-void HttpProtocolHandler::handleWebSocketUpgrade(std::shared_ptr<core::IConnection> conn, const HttpRequest& req) {
-    std::string key = req.GetHeader("Sec-WebSocket-Key");
-    if (key.empty()) {
-        conn->Close();
-        return;
-    }
-
-    // 发送握手响应
-    std::string response = websocket::WebSocketSession::HandshakeResponse(key);
-    auto send_result = conn->Send(response);
-    if (send_result.has_error()) {
-        conn->Close();
-        return;
-    }
-
-    std::cout << "🔌 WebSocket upgrade successful for connection " << conn->GetConnectionId() << std::endl;
-
-    // 创建 WebSocket 会话
-    auto ws_session = std::make_shared<websocket::WebSocketSession>(conn);
-
-    // 设置消息回调（可自定义业务逻辑）
-    ws_session->SetOnMessage([](const std::string& msg) {
-        std::cout << "📨 WebSocket message: " << msg << std::endl;
-    });
-    ws_session->SetOnClose([](uint16_t code, const std::string& reason) {
-        std::cout << "🔌 WebSocket closed: code=" << code << ", reason=" << reason << std::endl;
-    });
-
-    // 保存会话
-    uint64_t conn_id = conn->GetConnectionId();
-    {
-        std::unique_lock lock(websocket_mutex_);
-        websocket_sessions_[conn_id] = ws_session;
-    }
-
-    // 替换数据回调为 WebSocket 处理
-    conn->SetDataCallback([ws_session](std::shared_ptr<core::IConnection> c, std::string_view data) {
-        ws_session->OnData(data);
-    });
-
-    // 从 HTTP 上下文中移除
-    RemoveContext(conn_id);
-
-    // ========== 启动测速数据发送线程 ==========
-    // 前端 index.html 通过 WebSocket 接收二进制数据来计算速度
-    std::thread([fd = conn->GetFd()]() {
-        const size_t chunk_size = 64 * 1024;  // 64KB
-        std::vector<uint8_t> test_data(chunk_size, 0xAA);  // 填充测试数据
-        auto start_time = std::chrono::steady_clock::now();
-        const int duration_seconds = 10;  // 持续发送 10 秒
-
-        while (true) {
-            // 编码为 WebSocket 二进制帧
-            auto frame = websocket::FrameCodec::EncodeBinary(test_data);
-            ssize_t sent = send(fd, frame.data(), frame.size(), 0);
-            if (sent < 0) {
-                std::cerr << "WebSocket send error: " << strerror(errno) << std::endl;
-                break;
-            }
-
-            // 检查是否达到持续时间
-            auto elapsed = std::chrono::steady_clock::now() - start_time;
-            if (elapsed >= std::chrono::seconds(duration_seconds)) {
-                break;
-            }
-
-            // 极短延时，避免占满 CPU（实际可无延时，但为了稳定加 1ms）
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        // 发送关闭帧
-        auto close_frame = websocket::FrameCodec::EncodeClose(1000, "Test finished");
-        send(fd, close_frame.data(), close_frame.size(), 0);
-        close(fd);
-        std::cout << "📊 Speed test data transmission completed" << std::endl;
-    }).detach();
-}
-
-std::shared_ptr<websocket::WebSocketSession> HttpProtocolHandler::GetWebSocketSession(uint64_t conn_id) {
-    std::shared_lock lock(websocket_mutex_);
-    auto it = websocket_sessions_.find(conn_id);
-    return it != websocket_sessions_.end() ? it->second : nullptr;
-}
-
 void HttpProtocolHandler::OnError(std::shared_ptr<core::IConnection> conn, std::error_code ec) {
     if (!conn) return;
-
     uint64_t conn_id = conn->GetConnectionId();
-    {
-        std::unique_lock lock(websocket_mutex_);
-        websocket_sessions_.erase(conn_id);
-    }
     RemoveContext(conn_id);
-
     std::cerr << "Connection error: " << ec.message() << std::endl;
 }
 
 // ============================================================================
-// HTTP 解析
+// HTTP 解析（保持不变）
 // ============================================================================
 
 bool HttpProtocolHandler::ParseHttpRequest(ConnectionHttpContext& ctx, HttpRequest& req) {
-    // 查找请求结束标记（\r\n\r\n）
     size_t header_end = ctx.buffer.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        return false;
-    }
+    if (header_end == std::string::npos) return false;
 
     std::string header_part = ctx.buffer.substr(0, header_end);
-
-    // 解析请求行
     size_t line_end = header_part.find("\r\n");
     if (line_end == std::string::npos) return false;
 
@@ -313,15 +194,12 @@ bool HttpProtocolHandler::ParseHttpRequest(ConnectionHttpContext& ctx, HttpReque
     std::istringstream line_stream(request_line);
     std::string method, path, version;
 
-    if (!(line_stream >> method >> path >> version)) {
-        return false;
-    }
+    if (!(line_stream >> method >> path >> version)) return false;
 
     req.SetMethod(method);
     req.SetPath(path);
     req.SetVersion(version);
 
-    // 解析头部
     size_t pos = line_end + 2;
     while (pos < header_part.size()) {
         size_t header_line_end = header_part.find("\r\n", pos);
@@ -335,65 +213,35 @@ bool HttpProtocolHandler::ParseHttpRequest(ConnectionHttpContext& ctx, HttpReque
             value.erase(0, value.find_first_not_of(" \t"));
             req.AddHeader(key, value);
         }
-
         pos = header_line_end + 2;
     }
 
-    // 获取 Content-Length
     std::string content_length_str = req.GetHeader("Content-Length");
     size_t content_length = content_length_str.empty() ? 0 : std::stoul(content_length_str);
-
     if (content_length > max_body_size_) return false;
 
     size_t body_start = header_end + 4;
     if (ctx.buffer.size() < body_start + content_length) return false;
 
     if (content_length > 0) {
-        std::string body = ctx.buffer.substr(body_start, content_length);
-        req.SetBody(body);
+        req.SetBody(ctx.buffer.substr(body_start, content_length));
     }
 
-    // 解析查询参数
     size_t query_pos = path.find('?');
     if (query_pos != std::string::npos) {
-        std::string query_string = path.substr(query_pos + 1);
-        path = path.substr(0, query_pos);
-        req.SetPath(path);
-
-        size_t start = 0;
-        while (start < query_string.size()) {
-            size_t eq_pos = query_string.find('=', start);
-            size_t amp_pos = query_string.find('&', start);
-
-            if (eq_pos != std::string::npos && (amp_pos == std::string::npos || eq_pos < amp_pos)) {
-                std::string key = query_string.substr(start, eq_pos - start);
-                std::string value;
-                size_t value_end = (amp_pos == std::string::npos) ? query_string.size() : amp_pos;
-                if (eq_pos + 1 < value_end) {
-                    value = query_string.substr(eq_pos + 1, value_end - eq_pos - 1);
-                }
-                //req.AddQueryParam(key, HttpParser::UrlDecode(value));
-                start = value_end + 1;
-            } else {
-                start = (amp_pos == std::string::npos) ? query_string.size() : amp_pos + 1;
-            }
-        }
+        req.SetPath(path.substr(0, query_pos));
     }
 
-    // 解析表单数据
     if (req.GetMethod() == "POST" &&
         req.GetHeader("Content-Type").find("application/x-www-form-urlencoded") != std::string::npos) {
         req.ParseFormData();
     }
 
-    // 判断 keep-alive
     std::string conn_header = req.GetHeader("Connection");
     ctx.is_keep_alive = (conn_header == "keep-alive" ||
                          (conn_header.empty() && version == "HTTP/1.1"));
 
-    size_t consumed = body_start + content_length;
-    ctx.buffer.erase(0, consumed);
-
+    ctx.buffer.erase(0, body_start + content_length);
     return true;
 }
 
@@ -402,11 +250,11 @@ bool HttpProtocolHandler::ParseHttpRequest(ConnectionHttpContext& ctx, HttpReque
 // ============================================================================
 
 void HttpProtocolHandler::HandleRequest(std::shared_ptr<core::IConnection> conn, const HttpRequest& req) {
-std::cout << "📋 HandleRequest: " << req.GetMethod() << " " << req.GetPath() << std::endl;
+    std::cout << "📋 HandleRequest: " << req.GetMethod() << " " << req.GetPath() << std::endl;
 
     HttpResponse resp;
-
     HttpRequest mutable_req = req;
+
     if (!ExecuteMiddlewares(mutable_req, resp)) {
         SendResponse(conn, resp);
         return;

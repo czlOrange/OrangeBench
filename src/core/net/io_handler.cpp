@@ -229,6 +229,14 @@ public:
     std::string ErrorToString(int error_code) override {
         return std::strerror(error_code);
     }
+
+    IOResult<void> GetSocketOption(SocketFd fd, int level, int optname,
+                                    void* optval, socklen_t* optlen) override {
+        if (::getsockopt(fd, level, optname, optval, optlen) == -1) {
+            return std::error_code(errno, std::system_category());
+        }
+        return {};
+    }
 };
 
 // 工厂方法实现

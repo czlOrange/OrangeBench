@@ -1,111 +1,359 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>局域网测速工具</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; margin: 0; padding: 20px; }
-        .container { background: white; border-radius: 20px; padding: 40px; max-width: 600px; width: 100%; text-align: center; }
-        .speed-value { font-size: 48px; font-weight: bold; color: #667eea; }
-        button { background: #667eea; color: white; border: none; padding: 12px 30px; border-radius: 25px; cursor: pointer; margin: 10px; font-size: 16px; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
-        .status { margin: 20px; padding: 10px; border-radius: 10px; font-weight: bold; }
-        .status.testing { background: #fff3cd; color: #856404; }
-        .status.completed { background: #d4edda; color: #155724; }
-        .status.error { background: #f8d7da; color: #721c24; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: rgba(255,255,255,0.95);
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: 400;
+        }
+        .speed-display {
+            margin: 30px 0;
+        }
+        .speed-number {
+            font-size: 72px;
+            font-weight: 700;
+            color: #667eea;
+            line-height: 1.2;
+        }
+        .speed-unit {
+            font-size: 24px;
+            color: #666;
+            margin-left: 8px;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            margin: 20px 0;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: #667eea;
+            border-radius: 4px;
+            transition: width 0.1s;
+        }
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 14px 40px;
+            font-size: 18px;
+            border-radius: 40px;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 20px;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.5);
+        }
+        button:disabled {
+            background: #ccc;
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .status {
+            color: #666;
+            margin-top: 16px;
+            min-height: 24px;
+        }
+        .stats {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 30px;
+            color: #555;
+            font-size: 14px;
+        }
+        .stat-item {
+            text-align: center;
+        }
+        .stat-value {
+            font-weight: 600;
+            color: #333;
+        }
     </style>
-    <!-- 暂时注释 Chart.js
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    -->
 </head>
 <body>
 <div class="container">
-    <h1>📡 局域网测速工具</h1>
-    <div class="speed-value" id="speedValue">0.00</div>
-    <div>Mbps</div>
-    <!-- 暂时隐藏图表
-    <canvas id="speedChart" width="500" height="200"></canvas>
-    -->
+    <h1>⚡ 局域网测速工具</h1>
+    <div class="speed-display">
+        <span class="speed-number" id="speedValue">0.00</span>
+        <span class="speed-unit">Mbps</span>
+    </div>
+    <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+    </div>
     <button id="startBtn">开始测速</button>
-    <div class="status" id="status">⚪ 未连接</div>
+    <div class="status" id="status"></div>
+    <div class="stats">
+        <div class="stat-item">
+            <div>峰值速度</div>
+            <div class="stat-value" id="peakSpeed">0.00 Mbps</div>
+        </div>
+        <div class="stat-item">
+            <div>传输总量</div>
+            <div class="stat-value" id="totalData">0 MB</div>
+        </div>
+    </div>
 </div>
 
 <script>
-    let ws = null, isTesting = false, totalBytes = 0, startTime = 0, speedHistory = [];
-    let updateInterval = null;
-    let deviceId = localStorage.getItem('device_id') || 'device_' + Math.random().toString(36).substr(2, 8);
-    localStorage.setItem('device_id', deviceId);
-    
-    function updateUI() {
-        if (!isTesting) return;
-        let elapsed = (Date.now() - startTime) / 1000;
-        if (elapsed < 0.1) return;
-        let speedMbps = (totalBytes * 8) / elapsed / 1e6;
-        document.getElementById('speedValue').innerText = speedMbps.toFixed(2);
-    }
-    
-    async function saveRecord(speed) {
-        try {
-            await fetch('/api/record', {
+    (function(){
+        // DOM 元素
+        const speedEl = document.getElementById('speedValue');
+        const progressFill = document.getElementById('progressFill');
+        const startBtn = document.getElementById('startBtn');
+        const statusEl = document.getElementById('status');
+        const peakSpeedEl = document.getElementById('peakSpeed');
+        const totalDataEl = document.getElementById('totalData');
+
+        // 测速配置
+        const TEST_DURATION = 10000;          // 总测速时长 10 秒
+        const WINDOW_SIZE = 2000;              // 滑动窗口大小 2 秒
+        const UPDATE_INTERVAL = 100;           // UI 更新间隔 100ms
+
+        // 状态变量
+        let ws = null;
+        let testStartTime = 0;
+        let totalBytes = 0;
+        let peakSpeed = 0;
+        let isRunning = false;
+        let chunks = [];                       // 存储 { ts, bytes }
+        let uiTimer = null;
+
+        // 辅助函数：格式化数字
+        function formatSpeed(mbps) {
+            return mbps.toFixed(2);
+        }
+
+        function formatData(bytes) {
+            return (bytes / (1024 * 1024)).toFixed(2);
+        }
+
+        // 更新 UI
+        function updateUI(speedMbps) {
+            speedEl.textContent = formatSpeed(speedMbps);
+            
+            // 更新峰值
+            if (speedMbps > peakSpeed) {
+                peakSpeed = speedMbps;
+                peakSpeedEl.textContent = formatSpeed(peakSpeed) + ' Mbps';
+            }
+            
+            // 更新总量
+            totalDataEl.textContent = formatData(totalBytes) + ' MB';
+            
+            // 更新进度条
+            if (isRunning && testStartTime > 0) {
+                const elapsed = Date.now() - testStartTime;
+                const progress = Math.min(100, (elapsed / TEST_DURATION) * 100);
+                progressFill.style.width = progress + '%';
+            }
+        }
+
+        // 计算滑动窗口内的瞬时速度（Mbps）
+        function computeInstantSpeed() {
+            if (chunks.length === 0) return 0;
+            
+            const now = Date.now();
+            
+            // 移除超出窗口的旧数据
+            while (chunks.length > 0 && now - chunks[0].ts > WINDOW_SIZE) {
+                chunks.shift();
+            }
+            
+            if (chunks.length < 2) return 0;
+            
+            const first = chunks[0];
+            const last = chunks[chunks.length - 1];
+            
+            // 计算窗口内总字节和时间跨度
+            let windowBytes = 0;
+            for (const c of chunks) {
+                windowBytes += c.bytes;
+            }
+            
+            const durationSec = (last.ts - first.ts) / 1000;
+            if (durationSec <= 0) return 0;
+            
+            return (windowBytes * 8) / durationSec / 1e6;
+        }
+
+        // 处理接收到的数据块
+        function handleDataChunk(data) {
+            const now = Date.now();
+            const bytes = data.byteLength || data.size || data.length;
+            
+            totalBytes += bytes;
+            chunks.push({ ts: now, bytes });
+            
+            // 限制 chunks 数组大小，避免内存无限增长
+            const maxChunks = Math.ceil(WINDOW_SIZE / 50) + 10;
+            if (chunks.length > maxChunks * 2) {
+                chunks = chunks.slice(-maxChunks);
+            }
+        }
+
+        // UI 定时刷新（独立于数据接收频率）
+        function startUITimer() {
+            if (uiTimer) clearInterval(uiTimer);
+            uiTimer = setInterval(() => {
+                if (!isRunning) return;
+                const speed = computeInstantSpeed();
+                updateUI(speed);
+            }, UPDATE_INTERVAL);
+        }
+
+        function stopUITimer() {
+            if (uiTimer) {
+                clearInterval(uiTimer);
+                uiTimer = null;
+            }
+        }
+
+        // 重置状态
+        function resetState() {
+            totalBytes = 0;
+            peakSpeed = 0;
+            chunks = [];
+            progressFill.style.width = '0%';
+            speedEl.textContent = '0.00';
+            peakSpeedEl.textContent = '0.00 Mbps';
+            totalDataEl.textContent = '0 MB';
+            statusEl.textContent = '';
+        }
+
+        // 结束测速（正常完成或出错）
+        function finishTest(finalSpeed = null) {
+            if (!isRunning) return;
+            isRunning = false;
+            startBtn.disabled = false;
+            startBtn.textContent = '开始测速';
+            stopUITimer();
+            
+            // 计算最终速度（如果未提供，则使用当前窗口速度）
+            const finalSpeedValue = (finalSpeed !== null) ? finalSpeed : computeInstantSpeed();
+            updateUI(finalSpeedValue);
+            
+            // 保存记录到后端
+            saveRecord(finalSpeedValue);
+            
+            statusEl.textContent = '测速完成';
+            progressFill.style.width = '100%';
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        // 向后端保存测速记录
+        function saveRecord(speedMbps) {
+            const payload = {
+                speed: speedMbps,
+                device_id: 'web_' + Date.now(),
+                device_name: navigator.userAgent.match(/\((.*?)\)/)?.[1] || 'Web Browser',
+                latency_ms: 0,
+                packet_loss: 0
+            };
+            
+            fetch('/api/record', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    speed: speed,
-                    device_id: deviceId,
-                    device_name: navigator.userAgent.split(' ')[0] || 'Unknown'
-                })
-            });
-            console.log('记录已保存');
-        } catch(e) { console.error('保存失败', e); }
-    }
-    
-    function startTest() {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-        ws = new WebSocket('ws://' + location.host + '/');
-        ws.binaryType = 'arraybuffer';
-        
-        ws.onopen = () => {
-            console.log('✅ WebSocket 连接成功');
-            isTesting = true;
-            totalBytes = 0;
-            startTime = Date.now();
-            speedHistory = [];
-            if (updateInterval) clearInterval(updateInterval);
-            updateInterval = setInterval(updateUI, 100);
-            document.getElementById('status').className = 'status testing';
-            document.getElementById('status').innerHTML = '🟢 测速中...';
-            document.getElementById('startBtn').disabled = true;
-        };
-        
-        ws.onmessage = (e) => {
-            if (e.data instanceof ArrayBuffer) {
-                totalBytes += e.data.byteLength;
-                console.log('收到数据:', e.data.byteLength, '总:', totalBytes);
-            }
-        };
-        
-        ws.onclose = () => {
-            console.log('WebSocket 连接关闭');
-            isTesting = false;
-            if (updateInterval) clearInterval(updateInterval);
-            let elapsed = (Date.now() - startTime) / 1000;
-            if (elapsed < 0.1) elapsed = 1;
-            let finalSpeed = (totalBytes * 8) / elapsed / 1e6;
-            document.getElementById('status').className = 'status completed';
-            document.getElementById('status').innerHTML = '🔴 测速完成 - ' + finalSpeed.toFixed(1) + ' Mbps';
-            document.getElementById('startBtn').disabled = false;
-            if (totalBytes > 0) saveRecord(finalSpeed);
-        };
-        
-        ws.onerror = (error) => {
-            console.error('WebSocket 错误:', error);
-            document.getElementById('status').className = 'status error';
-            document.getElementById('status').innerHTML = '⚠️ 连接错误';
-            document.getElementById('startBtn').disabled = false;
-        };
-    }
-    
-    document.getElementById('startBtn').onclick = startTest;
+                body: JSON.stringify(payload)
+            }).catch(e => console.warn('保存记录失败:', e));
+        }
+
+        // 开始测速
+        function startTest() {
+            if (isRunning) return;
+            
+            resetState();
+            isRunning = true;
+            testStartTime = Date.now();
+            startBtn.disabled = true;
+            startBtn.textContent = '测速中...';
+            statusEl.textContent = '正在连接服务器...';
+            
+            // 建立 WebSocket 连接
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${location.host}/ws/speedtest`;  // 根据你的实际 WebSocket 路径调整
+            
+            ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';  // 接收二进制数据
+            
+            ws.onopen = () => {
+                statusEl.textContent = '测速中...';
+                startUITimer();
+                
+                // 设置测速结束定时器
+                setTimeout(() => {
+                    if (isRunning) {
+                        finishTest();
+                    }
+                }, TEST_DURATION);
+            };
+            
+            ws.onmessage = (event) => {
+                if (!isRunning) return;
+                
+                // 处理接收到的数据（二进制）
+                if (event.data instanceof ArrayBuffer) {
+                    handleDataChunk(event.data);
+                } else if (typeof event.data === 'string') {
+                    // 可能是控制消息
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg.type === 'end') {
+                            finishTest(msg.final_speed);
+                        }
+                    } catch (e) {}
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket 错误:', error);
+                statusEl.textContent = '连接错误';
+                finishTest(0);
+            };
+            
+            ws.onclose = () => {
+                if (isRunning) {
+                    finishTest();
+                }
+            };
+        }
+
+        // 绑定按钮事件
+        startBtn.addEventListener('click', startTest);
+    })();
 </script>
 </body>
 </html>
